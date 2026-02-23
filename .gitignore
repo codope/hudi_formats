@@ -9,7 +9,9 @@
 *.toc
 *.synctex.gz
 *.fdb_latexmk
-# *.pdf
+*.pdf
 
 # Exception if you want to keep the final output PDF in the repo (optional)
-# !main.pdf
+!main.pdf
+!acmguide.pdf
+!sampleteaser.pdf
