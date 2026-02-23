@@ -1,0 +1,40 @@
+name: Compile LaTeX Paper
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build_and_validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate ACM 2-Column Proceedings Format
+        # This checks your main.tex for the 'acmart' document class with the 'sigconf' option.
+        # Change 'main.tex' if your primary file has a different name.
+        run: |
+          if ! grep -Eq '\\documentclass\[[^\]]*sigconf[^\]]*\]\{acmart\}' main.tex; then
+            echo "❌ ERROR: Document format validation failed."
+            echo "Your main.tex must use the ACM 2-column proceedings format."
+            echo "Ensure it contains: \documentclass[sigconf]{acmart}"
+            exit 1
+          else
+            echo "✅ ACM Proceedings format (sigconf) validated successfully."
+          fi
+
+      - name: Compile LaTeX document
+        uses: xu-cheng/latex-action@v3
+        with:
+          # Specify your main tex file here
+          root_file: main.tex
+          # latexmk is used by default, which safely handles bibliographies and multiple passes
+
+      - name: Upload compiled PDF as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-paper
+          path: main.pdf
