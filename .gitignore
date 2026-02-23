@@ -1,0 +1,15 @@
+# LaTeX auxiliary files
+*.aux
+*.bbl
+*.blg
+*.brf
+*.fls
+*.log
+*.out
+*.toc
+*.synctex.gz
+*.fdb_latexmk
+# *.pdf
+
+# Exception if you want to keep the final output PDF in the repo (optional)
+# !main.pdf

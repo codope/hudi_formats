@@ -1,0 +1,207 @@
+
+\documentclass[sigconf]{acmart}
+
+% FORMATS'26: 3 pages excluding references, ACM 2-column proceedings style, single-anonymous.
+\settopmatter{printfolios=true,printacmref=false}
+\setcopyright{none}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+
+\usepackage{booktabs}
+\usepackage{microtype}
+
+\begin{document}
+
+\title{Metadata-as-Data in Apache Hudi: Multi-Modal Indexing and Concurrent Index Onboarding on Object Storage}
+
+% TODO: Replace with the final author list (single-anonymous: include authors + affiliations).
+\author{First Author}
+\affiliation{%
+  \institution{Apache Hudi (PMC), Organization}
+  \city{City}
+  \country{Country}
+}
+\email{first.author@domain.com}
+
+\author{Second Author}
+\affiliation{%
+  \institution{Organization}
+  \city{City}
+  \country{Country}
+}
+\email{second.author@domain.com}
+
+\begin{abstract}
+Open table formats increasingly serve as the transactional layer for lakehouse architectures built on cloud object storage.
+Yet, object stores expose costly metadata operations (e.g., recursive listings) and make planning-time statistics expensive to obtain at scale.
+Apache Hudi addresses these bottlenecks by treating metadata and indexes as first-class \emph{table data}:
+each table maintains an internal \emph{metadata table} (an internal Merge-on-Read table) that stores file listings and multiple index modalities (column statistics, bloom filters, record/secondary/expression indexes) in an SSTable-like layout.
+To avoid blocking high-throughput ingestion, Hudi further supports \emph{concurrent index onboarding}---a two-phase (plan/execute) protocol that backfills large indexes asynchronously while writers continue to commit.
+We describe this ``metadata-as-data'' design and its concurrency model, and we summarize representative results on TPC-DS where a secondary index reduces scanned data by 90\% and improves warm-run latency by 58\%.
+We conclude with interoperability implications: index/metadata interfaces remain inconsistent across engines, motivating standardized contracts for index discovery, consumption, and online backfill in open table formats.
+\end{abstract}
+
+\keywords{Lakehouse, table formats, object storage, metadata management, data skipping, adaptive indexing, Apache Hudi}
+
+\maketitle
+
+\section{Introduction}
+
+The lakehouse pattern relies on open file formats (e.g., Parquet) and table formats (log-structured tables) to provide ACID semantics, schema evolution, and time travel over cloud object stores \cite{armbrust2021lakehouse,camacho2024lstbench}.
+However, as tables scale to millions of objects, \emph{metadata} becomes a dominant cost.
+Object stores implement a key--value interface where directory listings and bulk footer/stat reads can be expensive; Delta Lake explicitly calls out costly object-store metadata operations (such as listing) as a barrier to high performance \cite{armbrust2020deltalake}.
+Meanwhile, once metadata grows large, it requires database-style management techniques \cite{edara2021bigmetadata}.
+
+This paper focuses on one architectural response in Apache Hudi: \textbf{metadata-as-data}.
+Hudi maintains an internal \emph{metadata table} that stores file listings and multiple index modalities, enabling lookup-based planning and pruning in place of repeated recursive listings and broad footer scans \cite{hudi-metadata}.
+Further, Hudi supports \textbf{concurrent index onboarding} so that large, expensive indexes can be backfilled asynchronously without pausing ingestion \cite{hudi-indexing}.
+These mechanisms directly align with the FORMATS workshop interest in metadata organization, indexing, and workload-aware maintenance \cite{formats2026cfp}.
+
+\textbf{Contributions.} We contribute:
+(1) a compact description of Hudi's metadata table design as an internal, scalable index substrate;
+(2) an explanation of Hudi's multi-modal indexing as metadata-table partitions and its online backfill protocol; and
+(3) a small, representative evaluation showing query pruning benefits from secondary indexing on TPC-DS.
+
+\section{Metadata Table as an Index Substrate}
+
+\subsection{Overview}
+Hudi tracks metadata about a table to remove bottlenecks in achieving read/write performance, especially on cloud storage.
+In particular, it (i) avoids list operations to obtain the set of files in a table and (ii) exposes column statistics to reduce expensive broad footer reads for planning and pruning \cite{hudi-metadata}.
+Each Hudi table contains a special internal \emph{metadata table}, implemented as a single internal Merge-on-Read (MoR) table, with different metadata/index types stored as partitions \cite{hudi-metadata}.
+For physical storage, the metadata table uses HFile as the base file format to support efficient key lookups \cite{hudi-metadata}.
+
+\begin{figure}[t]
+  \centering
+  \fbox{\parbox{0.95\columnwidth}{
+  \small
+  \textbf{Diagram placeholder.}
+  Engines obtain candidate files via the \texttt{files} partition (metadata-based listing) and prune using
+  \texttt{column\_stats}/\texttt{partition\_stats}. Equality predicates can consult
+  \texttt{record\_index} and optional secondary/expression index partitions.
+  }}
+  \Description{Overview of how query engines consult Hudi metadata table partitions for file listing and pruning.}
+  \caption{Metadata-as-data: file listings and multi-modal indexes stored in Hudi's metadata table.}
+  \label{fig:mdt}
+\end{figure}
+
+\subsection{Metadata types and access patterns}
+The \texttt{files} partition stores file listings (names, sizes, active state) and the set of partitions, enabling metadata-based listing without direct object-store listings \cite{hudi-metadata}.
+The \texttt{column\_stats} and \texttt{partition\_stats} partitions store min/max/null-counts and related statistics, enabling data skipping during query planning \cite{hudi-metadata}.
+A \texttt{bloom\_filters} partition stores bloom filters centrally to avoid scanning footers across many data files \cite{hudi-indexes}.
+
+\subsection{Multi-modal indexing as metadata partitions}
+Hudi extends the metadata table with additional partitions to implement \emph{multi-modal indexing}.
+A record index maintains a mapping from record keys to file locations to support fast upserts/deletes and point lookups, while secondary indexes map non-key column values to record keys and use the record index to retrieve file locations \cite{hudi-indexes}.
+Expression indexes index transformed values (e.g., \texttt{from\_unixtime(ts)}) to optimize predicates that do not directly match raw columns \cite{hudi-indexes}.
+Hudi's indexing documentation describes this as enhancing the metadata table with new index types as partitions, complemented by an asynchronous index-building mechanism \cite{hudi-indexes}.
+
+\section{Concurrent Index Onboarding}
+
+A central tradeoff in indexing is balancing write throughput with index maintenance.
+Hudi supports creating indexes via SQL and programmatic APIs, including asynchronous indexing, to avoid locking out writers on large tables \cite{hudi-indexing}.
+For very large tables, Hudi provides \textbf{concurrent indexing} using a \emph{two-phase protocol} \cite{hudi-indexing}:
+(i) \emph{scheduling/planning} creates an indexing plan over all completed commits up to an indexing instant under a lock, and
+(ii) \emph{execution} builds index files and then validates/catches up commits that completed during execution under a metadata-table lock.
+This design mixes optimistic concurrency control with multi-version techniques so other writers are unblocked while an index snapshot is established \cite{hudi-indexing}.
+
+\section{Evaluation: Secondary Index on TPC-DS}
+
+We report a representative benchmark from Hudi's secondary index evaluation on a 1TB TPC-DS dataset \cite{hudi-secondary-index-blog}.
+The setup used Spark 3.5.5 on an EMR cluster and Hudi 1.0.1, building a secondary index on the \texttt{web\_sales} fact table (\texttt{ws\_ship\_customer\_sk}) and running a join query with a point predicate on that column \cite{hudi-secondary-index-blog}.
+Table~\ref{tab:tpcds} summarizes the published results: the secondary index reduced scanned data from 67\,GB to 7\,GB (90\%) and reduced warm-run latency from 14\,s to 6\,s (58\%), while reducing files read from 5{,}000 to 521 \cite{hudi-secondary-index-blog}.
+
+\begin{table}[t]
+\caption{TPC-DS (1TB) secondary index benchmark on \texttt{web\_sales} (Spark 3.5.5, Hudi 1.0.1). Results from \cite{hudi-secondary-index-blog}.}
+\label{tab:tpcds}
+\centering
+\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+\textbf{Setting} & \textbf{Run 1 (s)} & \textbf{Run 2 (s)} & \textbf{GB read} & \textbf{Files read} \\
+\midrule
+No secondary index & 32 & 14 & 67 & 5000 \\
+With secondary index & 22 & 6 & 7 & 521 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+While this experiment isolates one index type, it demonstrates the key benefit of metadata-resident indexes for ``needle-in-a-haystack'' predicates.
+Complementary results in Hudi's indexing deep dive report that, on a 400\,GB synthetic table with 20{,}000 file groups, a point predicate on a single record key improved from 977\,s to 12\,s when using the record index \cite{hudi-indexing-deep-dive-part2}.
+
+\section{Interoperability Implications}
+
+Storing metadata efficiently is necessary but not sufficient: engines must \emph{consume} it.
+Hudi documents that Spark and Flink can use metadata-based listing; Presto can fetch file names/sizes from the metadata table; and support in Trino for reading from the metadata table was dropped in Trino 419 \cite{hudi-metadata}.
+Amazon Athena notes that it currently supports only the file listing index from Hudi's metadata table \cite{athena-hudi-metadata}.
+These discrepancies suggest an ecosystem gap: we lack standardized contracts for index discovery and safe consumption across engines.
+
+We argue that open table formats should standardize: (i) schemas for common index modalities (file listings, stats, row/secondary/expression indexes), (ii) an online backfill protocol (like Hudi's plan/execute) with well-defined consistency, and (iii) capability negotiation so engines can safely leverage available indexes.
+
+\section{Conclusion}
+
+Hudi's ``metadata-as-data'' pattern stores file listings and multi-modal indexes inside an internal metadata table to avoid object-store metadata bottlenecks and enable lookup-based pruning.
+Hudi further supports concurrent index onboarding to build expensive indexes asynchronously without pausing ingestion.
+Our summarized evaluation shows that metadata-resident secondary indexing can reduce scanned data by 90\% and improve warm-run latency by 58\% on TPC-DS.
+More broadly, interoperability remains the limiting factor: to fully realize metadata-rich formats across heterogeneous compute and emerging AI/vector workloads, the community needs standardized index/metadata interfaces and online backfill semantics.
+
+\begin{thebibliography}{10}
+
+\bibitem{formats2026cfp}
+FORMATS'26.
+\newblock {Call for Papers: International Workshop on Data Formats}.
+\newblock \url{https://dataformats.org/call-for-papers.html}.
+
+\bibitem{armbrust2021lakehouse}
+Michael Armbrust, Ali Ghodsi, Reynold Xin, and Matei Zaharia.
+\newblock {Lakehouse: A New Generation of Open Platforms that Unify Data Warehousing and Advanced Analytics}.
+\newblock In \emph{CIDR}, 2021.
+
+\bibitem{camacho2024lstbench}
+Jes{\'u}s Camacho-Rodr{\'i}guez, Ashvin Agrawal, Anja Gruenheid, Ashit Gosalia, Cristian Petculescu, Josep Aguilar-Saborit, Avrilia Floratou, Carlo Curino, and Raghu Ramakrishnan.
+\newblock {LST-Bench: Benchmarking Log-Structured Tables in the Cloud}.
+\newblock \emph{Proc. ACM Manag. Data}, 2(1), 2024.
+
+\bibitem{armbrust2020deltalake}
+Michael Armbrust et~al.
+\newblock {Delta Lake: High-Performance ACID Table Storage over Cloud Object Stores}.
+\newblock \emph{Proc. VLDB Endow.}, 13(12):3411--3424, 2020.
+
+\bibitem{edara2021bigmetadata}
+Pavan Edara and Mosha Pasumansky.
+\newblock {Big Metadata: When Metadata is Big Data}.
+\newblock \emph{Proc. VLDB Endow.}, 14(12):3083--3095, 2021.
+
+\bibitem{hudi-metadata}
+Apache Hudi.
+\newblock {Table Metadata (Documentation)}.
+\newblock \url{https://hudi.apache.org/docs/metadata/}.
+
+\bibitem{hudi-indexing}
+Apache Hudi.
+\newblock {Indexing / Concurrent Indexing (Documentation)}.
+\newblock \url{https://hudi.apache.org/docs/metadata_indexing/}.
+
+\bibitem{hudi-indexes}
+Apache Hudi.
+\newblock {Indexes (Documentation)}.
+\newblock \url{https://hudi.apache.org/docs/indexes/}.
+
+\bibitem{hudi-secondary-index-blog}
+Dipankar Mazumdar and Aditya Goenka.
+\newblock {Introducing Secondary Index in Apache Hudi Lakehouse Platform}.
+\newblock Apache Hudi Blog, April 2, 2025.
+\newblock \url{https://hudi.apache.org/blog/2025/04/02/secondary-index/}.
+
+\bibitem{hudi-indexing-deep-dive-part2}
+Shiyan Xu.
+\newblock {Deep Dive Into Hudi's Indexing Subsystem (Part 2 of 2)}.
+\newblock Apache Hudi Blog, November 12, 2025.
+\newblock \url{https://hudi.apache.org/blog/2025/11/12/deep-dive-into-hudis-indexing-subsystem-part-2-of-2/}.
+
+\bibitem{athena-hudi-metadata}
+Amazon Athena.
+\newblock {Use Hudi metadata for improved performance}.
+\newblock \url{https://docs.aws.amazon.com/athena/latest/ug/querying-hudi-metadata-table.html}.
+
+\end{thebibliography}
+
+\end{document}
