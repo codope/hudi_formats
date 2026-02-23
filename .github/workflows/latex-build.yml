@@ -14,10 +14,8 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Validate ACM 2-Column Proceedings Format
-        # This checks your main.tex for the 'acmart' document class with the 'sigconf' option.
-        # Change 'main.tex' if your primary file has a different name.
         run: |
-          if ! grep -Eq '\\documentclass\[[^\]]*sigconf[^\]]*\]\{acmart\}' main.tex; then
+          if ! grep -Eq '\\documentclass\[.*sigconf.*\]\{acmart\}' main.tex; then
             echo "❌ ERROR: Document format validation failed."
             echo "Your main.tex must use the ACM 2-column proceedings format."
             echo "Ensure it contains: \documentclass[sigconf]{acmart}"
