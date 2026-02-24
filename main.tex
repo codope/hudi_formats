@@ -82,15 +82,15 @@
 \email{second.author@domain.com}
 
 \begin{abstract}
-As lakehouse tables scale toward millions of files and partitions (e.g., Uber: 350\,PB, 6\,trillion rows/day), metadata operations become a first-order cost.
-Apache Hudi treats metadata and indexes as \emph{table data}: an internal \emph{metadata table} (itself a Merge-on-Read table) whose partitions implement a multi-modal indexing subsystem encompassing file listings, column statistics, bloom filters, record-level, secondary, and expression indexes.
+As lakehouse tables scale toward millions of files and partitions, metadata operations become a first-order cost.
+Apache Hudi treats \emph{metadata as data}: an internal metadata table (itself a Merge-on-Read table) whose partitions implement a multi-modal indexing subsystem encompassing file listings, column statistics, bloom filters, record-level, secondary, and expression indexes.
 Data and metadata updates are coupled via multi-table transactions so that commits are visible only when both tables are committed.
 To serve point and prefix lookups efficiently on object storage, Hudi stores metadata partitions in an SSTable-like layout (HFile) with composite keys that enable prefix scans over only the columns needed for planning.
-Concurrent index onboarding via a two-phase protocol backfills large indexes online while writers continue to commit.
-We summarize the design and report a TPC-DS (1\,TB) result where secondary indexing reduces data scanned by 90\% and improves warm-run latency by 58\%.
+Concurrent indexing via a two-phase protocol backfills large indexes online while writers continue to commit.
+We summarize the design and report improvements on both synthetic benchmarks (TPC-DS) and upsert-heavy workloads, demonstrating significant reductions in planning overhead, data shuffled, and write latency.
 \end{abstract}
 
-\keywords{Lakehouse, table formats, metadata management, data skipping, adaptive indexing, Apache Hudi}
+\keywords{Table formats, metadata management, adaptive indexing, point and range lookups, cloud object storage, Apache Hudi}
 
 \maketitle
 
@@ -98,34 +98,35 @@ We summarize the design and report a TPC-DS (1\,TB) result where secondary index
 
 Open table formats have become the transactional layer for lakehouse deployments on cloud object storage.
 At large scale, metadata becomes the bottleneck: directory listings and bulk footer/stat reads dominate planning latency and API cost \cite{armbrust2020deltalake}.
-Production deployments underscore the magnitude: Uber manages 19,500+ datasets (350\,PB, 6\,trillion rows/day) on Hudi \cite{uber-hudi-blog}, and ByteDance operates an exabyte-scale lake \cite{bytedance-hudi-blog}.
+Production deployments underscore the magnitude: Uber manages 19,500+ datasets (350\,PB, 6\,trillion rows/day) on Apache Hudi \cite{uber-hudi-blog}, and ByteDance operates an exabyte-scale lake \cite{bytedance-hudi-blog}.
 As systems reach this scale, metadata requires database-style techniques for storage, indexing, and maintenance \cite{edara2021bigmetadata}.
 
-In-file statistics (e.g., Parquet column-chunk min/max in page footers) are necessary but insufficient: footer metadata grows $O(\text{files} \times \text{columns})$, and every footer must be opened to perform file selection \cite{arrow-parquet-metadata}.
+In-file statistics such as Parquet column-chunk min/max values are necessary but insufficient: the total footer metadata is $O(\#\textit{files} \times \#\textit{columns})$, and every footer must be opened to perform file selection \cite{arrow-parquet-metadata}.
 For wide tables with thousands of columns, this amounts to hundreds of megabytes of metadata parsing per planning cycle.
 External index structures that decouple file selection from footer reads are essential \cite{datafusion-external-indexes}.
 
 Apache Hudi addresses this by treating metadata as first-class \emph{data}.
-Each Hudi table maintains an internal \emph{metadata table} that stores file listings and multiple index modalities, replacing recursive listings and broad footer scans with lookup-based planning \cite{hudi-metadata,onehouse-mmi}.
-Hudi further supports \emph{concurrent index onboarding} to build large indexes online without pausing ingestion \cite{hudi-indexing}.
+Each Hudi table maintains an internal \emph{metadata table} that stores file listings and multiple index modalities, replacing recursive listings and broad footer scans with index-based planning \cite{hudi-metadata,onehouse-mmi}.
+Hudi further supports \emph{concurrent indexing} to build large indexes online without pausing ingestion \cite{hudi-indexing}.
 
-\textbf{Contributions.}
-(1) Hudi's metadata-as-data design: an internal Hudi table functioning as an extensible multi-modal index substrate.
-(2) Physical layout and record-key design enabling efficient point and prefix lookups for wide tables.
-(3) Concurrent index onboarding protocol and a representative secondary-index result on TPC-DS.
+\textbf{Contributions.}\\
+(1) Hudi's metadata-as-data design: an internal Hudi table that functions as an extensible multi-modal index substrate, with HFile-based layout and composite prefix keys (\S\ref{sec:mdt}).\\
+(2) Multi-modal indexing modalities (record-level, secondary, expression, bloom) materialized as independently managed partitions (\S\ref{sec:modalities}).\\
+(3) A concurrent indexing protocol that builds indexes online without pausing writers (\S\ref{sec:concurrent}).\\
+(4) Evaluation on TPC-DS (secondary index) and upsert-heavy workloads (record-level index), with production evidence from Uber-scale deployments (\S\ref{sec:eval}).
 
 \section{The Metadata Table}
 \label{sec:mdt}
 
 \subsection{Organization}
-Hudi stores table metadata in an internal table under \texttt{.hoodie/metadata} \cite{hudi-techspec}.
-The metadata table is implemented as a single internal Hudi Merge-on-Read (MoR) table where each metadata or index type is stored as a distinct partition (e.g., \texttt{files}, \texttt{column\_stats}, \texttt{bloom\_filters}, \texttt{record\_index}, \texttt{secondary\_index\_\textless name\textgreater}, \texttt{expr\_index\_\textless name\textgreater}) \cite{hudi-metadata,hudi-techspec,hudi-indexes}.
+Hudi stores table metadata in an internal table co-located with the data table.
+The metadata table is a Merge-on-Read (MoR) Hudi table where each metadata or index type is a distinct partition (e.g., file listings, column statistics, bloom filters, record index, secondary and expression indexes; see Table~\ref{tab:modalities}) \cite{hudi-metadata,hudi-techspec,hudi-indexes}.
 Hudi offers two table types: Copy-on-Write (CoW), which rewrites entire files on each commit, and MoR, which appends delta logs and merges them on read or during compaction.
 MoR is the natural fit for metadata because every data commit generates metadata updates; CoW would require rewriting potentially large base files on each commit, whereas MoR amortizes this cost by buffering deltas in logs and compacting in the background \cite{hudi-metadata}.
-This mirrors database practice: metadata scales with the same durability, compaction, and maintenance mechanisms as user data.
+This mirrors database practice: the metadata table scales with the same durability, compaction, and maintenance mechanisms as the data table.
 
 \subsection{Transactional consistency}
-Hudi translates each data-table write into metadata-table updates and couples the two timelines so they remain in sync \cite{hudi-metadata}.
+Hudi translates each data table write into metadata table updates and couples the two timelines so they remain in sync \cite{hudi-metadata}.
 A write is visible only when \emph{both} the data table and metadata table are committed, preventing partial exposure of data or index state under failures \cite{onehouse-mmi}.
 
 \begin{figure}[t]
@@ -147,8 +148,8 @@ Hudi stores metadata partitions in an SSTable-like format (HFile), maintaining r
 Published experiments report 10--100$\times$ lower point-lookup latency for HFile compared to Parquet/Avro at 10M-entry scale \cite{onehouse-mmi}.
 
 \paragraph{Prefix key design for wide tables.}
-For \texttt{column\_stats}, Hudi composes record keys by concatenating \emph{column name}, \emph{partition name}, and \emph{data file name}, enabling prefix scans \cite{onehouse-mmi}.
-Planners issue prefix lookups only for columns referenced by a query, reducing work from $O(\#\text{table columns})$ to $O(\#\text{query columns})$ \cite{onehouse-mmi}.
+For column statistics, Hudi composes record keys by concatenating \emph{column name}, \emph{partition name}, and \emph{data file name}, enabling prefix scans.
+Planners issue prefix lookups only for columns referenced by a query, reducing work from $O(\#\textit{table columns})$ to $O(\#\textit{query columns})$ \cite{onehouse-mmi}.
 
 \section{Multi-Modal Indexing}
 \label{sec:modalities}
@@ -157,7 +158,7 @@ Hudi's metadata table acts as an \emph{index substrate}: index modalities are ma
 Table~\ref{tab:modalities} summarizes key modalities and their database analogues.
 
 \begin{table*}[t]
-\caption{Index modalities as metadata-table partitions. Each modality maps to a familiar database concept but is implemented as a partition within the internal MoR metadata table.}
+\caption{Index modalities as metadata-table partitions. Each modality maps to a familiar database concept and is implemented as a partition within the internal Hudi metadata table.}
 \label{tab:modalities}
 \centering
 \scriptsize
@@ -165,13 +166,13 @@ Table~\ref{tab:modalities} summarizes key modalities and their database analogue
 \toprule
 \textbf{MDT partition / modality} & \textbf{DB analogue} & \textbf{Lookup key (conceptual)} & \textbf{Primary effect} \\
 \midrule
-\texttt{files} (file listings) & catalog / manifest cache & partition path $\rightarrow$ file list & avoid object-store listings; faster planning/writes \\
+\texttt{record\_index} (global RLI) & primary index & record key $\rightarrow$ location & fast upserts/deletes; point lookups \\
+\texttt{secondary\_index} & secondary (inverted) index & secondary value $\rightarrow$ primary keys & accelerate predicates on non-key columns \\
+\texttt{expr\_index} & functional index & f(col) value/range & accelerate predicates on expressions; aids partition evolution \\
 \texttt{column\_stats} & zone maps / min-max stats & (col, partition, file) prefixes & file pruning via data skipping; wide-table selective reads \\
 \texttt{partition\_stats} & aggregated stats & (col, partition) & coarse partition pruning without file scans \\
 \texttt{bloom\_filters} & membership filters & (partition, file) & prune candidate files for existence checks / upserts \\
-\texttt{record\_index} (global RLI) & primary index & record key $\rightarrow$ location & fast upserts/deletes; point lookups \\
-\texttt{secondary\_index\_\textless name\textgreater} & secondary (inverted) index & secondary value $\rightarrow$ primary keys & accelerate predicates on non-key columns \\
-\texttt{expr\_index\_\textless name\textgreater} & functional index & f(col) value/range & accelerate predicates on expressions; aids partition evolution \\
+\texttt{files} (file listings) & catalog / manifest cache & partition path $\rightarrow$ file list & avoid object-store listings; faster planning/writes \\
 \bottomrule
 \end{tabular}
 \end{table*}
@@ -180,42 +181,51 @@ Table~\ref{tab:modalities} summarizes key modalities and their database analogue
 The record-level index (RLI) maps record keys to data-table locations in the \texttt{record\_index} partition \cite{hudi-indexes,hudi-techspec}.
 This is the lakehouse analogue of a \emph{primary index}: it enables efficient upserts and deletes by avoiding full file-group scans to locate candidate records.
 To accommodate large key spaces, the record index uses hash-based sharding and supports point lookups for keyed reads \cite{hudi-indexes,hudi-rli-blog}.
+We evaluate RLI performance on upsert workloads in \S\ref{sec:eval}.
 
 \subsection{Expression index}
-An expression index indexes a function of a column, stored under \texttt{expr\_index\_\textless name\textgreater} partitions \cite{hudi-indexes,hudi-techspec}.
-This aligns with classic \emph{functional indexes}: it creates an access path for predicates that do not match raw columns.
+An expression index indexes a function of a column, stored as an \texttt{expr\_index} partition \cite{hudi-indexes,hudi-techspec}.
+This is the lakehouse analogue of indexes on expressions in PostgreSQL \cite{pg-expr-index}: it creates an access path for predicates that do not match raw columns.
 
 \paragraph{Partition evolution.}
-A table partitioned by day (\texttt{dt=YYYY-MM-DD}) that later needs hour-level pruning can maintain an expression index over an hour-extraction function rather than rewriting data into hour partitions \cite{hudi-techspec,hudi-indexes}.
+The expression index also enables the partition evolution use case. Physical partitioning is a coarse-grained index; a table partitioned by day (e.g., \texttt{dt=YYYY-MM-DD}) cannot prune at finer granularity without repartitioning.
+An expression index over an hour-extraction function provides fine-grained file pruning by hour predicates without changing the physical layout \cite{hudi-techspec,hudi-indexes}.
 
-\subsection{Bloom filters}
+\subsection{Adaptive bloom filters}
 Bloom filters provide probabilistic membership tests that prune files during presence checks and upserts.
-Hudi supports \emph{dynamic bloom filters}, which adjust their size based on the number of records in a file to maintain a configured false-positive ratio \cite{hudi-indexes}.
+Hudi supports \emph{adaptive bloom filters}, which adjust their size based on the number of records in a file to maintain a configured false-positive ratio \cite{hudi-indexes}.
 This matters for streaming and skewed workloads where file-group cardinalities vary; static filters can saturate and lose pruning power.
 
 \subsection{Secondary index}
 The secondary index accelerates predicates on non-key columns by mapping secondary values to primary keys, then using RLI to retrieve file locations.
-Stored in \texttt{secondary\_index\_\textless name\textgreater}, the key encoding concatenates escaped secondary and primary keys, supporting uniqueness and efficient decoding \cite{hudi-techspec}.
+Its key encoding concatenates escaped secondary and primary keys, supporting uniqueness and efficient decoding \cite{hudi-techspec}.
 
-\section{Concurrent Index Onboarding}
+\section{Concurrent Indexing}
 \label{sec:concurrent}
 
 Indexes increase write cost because they must be maintained as data changes.
 Rather than pausing writers to build or rebuild large indexes, Hudi supports asynchronous index building and \emph{concurrent indexing} \cite{hudi-indexing}.
 
-Concurrent indexing uses a two-phase protocol (schedule/execute) that combines optimistic and multi-version techniques \cite{hudi-indexing}:
-(1) \textbf{Scheduling \& planning} creates an indexing plan over all completed commits up to an indexing instant under a lock; and
+Concurrent indexing uses a two-phase protocol (schedule/execute) that combines optimistic and multi-version concurrency control techniques:
+(1) \textbf{Scheduling} creates an indexing plan over all completed commits up to an indexing instant under a lock; and
 (2) \textbf{Execution} materializes index files and then validates/catches up commits that completed after the planned instant under a metadata-table lock, aborting on inconsistencies.
 Because metadata updates are transactionally coupled to data commits (\S\ref{sec:mdt}), this protocol can establish a consistent index snapshot while leaving writers unblocked.
 
 \section{Evaluation}
 \label{sec:eval}
 
-We report results from Hudi's published secondary index evaluation on TPC-DS (1\,TB) \cite{hudi-secondary-index-blog}.
-A secondary index on \texttt{web\_sales.ws\_ship\_customer\_sk} reduces scanned data by 90\% and improves warm-run latency by 58\% (Table~\ref{tab:tpcds}).
+We report published benchmark results for two index modalities and summarize production evidence from Uber-scale deployments.
+
+\paragraph{Setup.}
+Both benchmarks use Amazon EMR clusters.
+The secondary index benchmark uses Hudi 1.0.1 with Spark 3.5.5 on 10 \texttt{m5.xlarge} instances \cite{hudi-secondary-index-blog}.
+The RLI benchmark uses Hudi 0.14.0 with Spark 3.2.1 on 10 \texttt{m5.4xlarge} instances over a 1\,TB dataset (2 billion records) \cite{hudi-rli-blog}.
+
+\paragraph{Secondary index.}
+On TPC-DS SF-1000, a secondary index on the \texttt{ship\_customer\_sk} column in the \texttt{web\_sales} fact table reduces scanned data by 90\% and improves warm-run latency by 58\% (Table~\ref{tab:tpcds}).
 
 \begin{table}[t]
-\caption{TPC-DS (1TB) secondary index benchmark on \texttt{web\_sales}. Results reproduced from \cite{hudi-secondary-index-blog}.}
+\caption{Secondary index benchmark on TPC-DS SF-1000, \texttt{web\_sales} fact table. Results from \cite{hudi-secondary-index-blog}.}
 \label{tab:tpcds}
 \centering
 \small
@@ -229,6 +239,28 @@ With secondary index & 22 & 6 & 7 & 521 \\
 \end{tabular}
 \end{table}
 
+\paragraph{Record-level index.}
+On the 1\,TB upsert workload, RLI reduces write latency by 72\% and data shuffled during upserts by 92\% compared to a global simple index that scans all file groups (Table~\ref{tab:rli}).
+
+\begin{table}[t]
+\caption{Record-level index benchmark on 1\,TB (2B records). Results from \cite{hudi-rli-blog}.}
+\label{tab:rli}
+\centering
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Metric} & \textbf{Global Simple} & \textbf{Record Index} \\
+\midrule
+Write latency (relative) & 1.0$\times$ & 0.28$\times$ (\textbf{72\% reduction}) \\
+Data shuffled & 85\,GB & 0.7\,GB (\textbf{92\% reduction}) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Production evidence.}
+At Uber, 19,500+ Hudi datasets span 350\,PB with 6 trillion rows ingested daily \cite{uber-hudi-blog}.
+Of these, 3,600 upsert-heavy tables (exceeding 300 billion rows) rely on the record index in production, with per-key lookup latency of 1--2\,ms from sharded HFiles \cite{uber-hudi-blog}.
+
 \section{Discussion}
 
 All three major open table formats address the metadata bottleneck with different architectural choices.
@@ -238,18 +270,19 @@ Both designs reduce reliance on per-file footer scans for query planning.
 
 Hudi extends the metadata-management idea into a generalized index substrate.
 Rather than a log or manifest tree, Hudi stores metadata in an internal MoR table where each index modality (record-level, secondary, expression) is an independently managed partition \cite{hudi-metadata,hudi-indexes}.
-The HFile-based layout optimizes for point and prefix lookup patterns, and the concurrent onboarding protocol (\S\ref{sec:concurrent}) provides an explicit mechanism for building indexes online \cite{hudi-indexing}.
+The HFile-based layout optimizes for point and prefix lookup patterns as well as fast metadata updates, and the concurrent indexing protocol (\S\ref{sec:concurrent}) provides an explicit mechanism for building indexes online \cite{hudi-indexing}.
 This positions the metadata table not as a static manifest cache but as an extensible, lookup-oriented index structure that borrows from database indexing principles.
+In enterprise data lakes where records flow through multiple transformation stages (raw ingestion, enrichment, curated layers) with upserts at each stage, such a substrate directly reduces the cost of locating and updating records across the pipeline.
 
 \section{Conclusion}
 
 At exabyte scale, metadata management is a data-management problem.
 Hudi's metadata-as-data design stores metadata and indexes as a first-class internal MoR table, couples updates via multi-table transactions, and organizes index modalities as independently maintained partitions.
-The HFile-based layout with composite prefix keys reduces planning-time work from $O(\#\text{table columns})$ to $O(\#\text{query columns})$ for wide schemas, and concurrent index onboarding enables online backfill without pausing writers.
+The HFile-based layout with composite prefix keys reduces planning-time work from $O(\#\textit{table columns})$ to $O(\#\textit{query columns})$ for wide schemas, and concurrent indexing enables online backfill without pausing writers.
 Future directions include bitmap indexes for low-cardinality columns, vector indexes for embedding similarity, and adaptive index selection driven by observed workload patterns.
 As tables grow, metadata must be treated as managed, indexed data.
 
-\begin{thebibliography}{10}
+\begin{thebibliography}{16}
 
 \bibitem{armbrust2020deltalake}
 Michael Armbrust et~al.
@@ -332,6 +365,12 @@ DataFusion Blog.
 \newblock {Using External Indexes to Accelerate Queries on Parquet}.
 \newblock Aug 2025.
 \newblock \url{https://datafusion.apache.org/blog/2025/08/external-indexes/}.
+
+\bibitem{pg-expr-index}
+PostgreSQL Global Development Group.
+\newblock {Indexes on Expressions}.
+\newblock PostgreSQL Documentation.
+\newblock \url{https://www.postgresql.org/docs/current/indexes-expressional.html}.
 
 \end{thebibliography}
 
