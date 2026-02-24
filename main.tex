@@ -104,8 +104,8 @@ As lakehouse tables scale toward millions of files and partitions, metadata oper
 Apache Hudi treats \emph{metadata as data}: an internal metadata table (itself a Merge-on-Read table) whose partitions implement a multi-modal indexing subsystem encompassing file listings, column statistics, bloom filters, record-level, secondary, and expression indexes.
 Data and metadata updates are coupled via multi-table transactions so that commits are visible only when both tables are committed.
 To serve point and prefix lookups efficiently on object storage, Hudi stores metadata partitions in an SSTable-like layout (HFile) with composite keys that enable prefix scans over only the columns needed for planning.
-Concurrent indexing via a two-phase protocol backfills large indexes online while writers continue to commit.
-We summarize the design and report improvements on both synthetic benchmarks (TPC-DS) and upsert-heavy workloads, demonstrating significant reductions in planning overhead, data shuffled, and write latency.
+Concurrent indexing via a three-phase schedule/execute/reconcile protocol backfills large indexes online while writers continue to commit.
+We summarize the design and report improvements on both synthetic benchmarks (TPC-DS) and upsert-heavy workloads, demonstrating 90\% reduction in data scanned (secondary index on TPC-DS SF-1000), 72\% lower write latency and 92\% less data shuffled (record-level index on a 1\,TB upsert workload), with per-key lookup latency of 1--2\,ms at Uber's 350\,PB production scale.
 \end{abstract}
 
 \keywords{Table formats, metadata management, adaptive indexing, point and range lookups, cloud object storage, Apache Hudi}
@@ -114,14 +114,14 @@ We summarize the design and report improvements on both synthetic benchmarks (TP
 
 \section{Introduction}
 
-Open table formats have become the transactional layer for lakehouse deployments on cloud object storage.
+Open table formats have become the transactional layer for lakehouse deployments on cloud object storage \cite{zaharia2021lakehouse}.
 At large scale, metadata becomes the bottleneck: directory listings and bulk footer/stat reads dominate planning latency and API cost \cite{armbrust2020deltalake}.
 Production deployments underscore the magnitude: Uber manages 19,500+ datasets (350\,PB, 6\,trillion rows/day) on Apache Hudi \cite{uber-hudi-blog}, and ByteDance operates an exabyte-scale lake \cite{bytedance-hudi-blog}.
 As systems reach this scale, metadata requires database-style techniques for storage, indexing, and maintenance \cite{edara2021bigmetadata}.
 
-In-file statistics such as Parquet column-chunk min/max values are necessary but insufficient: the total footer metadata is $O(\#\textit{files} \times \#\textit{columns})$, and every footer must be opened to perform file selection \cite{arrow-parquet-metadata}.
+In-file statistics such as Parquet column-chunk min/max values are necessary but insufficient: the total footer metadata is $O(\#\textit{files} \times \#\textit{columns})$, and every footer must be opened to perform file selection \cite{zeng2024columnar}.
 For wide tables with thousands of columns, this amounts to hundreds of megabytes of metadata parsing per planning cycle.
-External index structures that decouple file selection from footer reads are essential \cite{datafusion-external-indexes}.
+External index structures that decouple file selection from footer reads are essential \cite{liu2023openformats}.
 
 Apache Hudi addresses this by treating metadata as first-class \emph{data}.
 Each Hudi table maintains an internal \emph{metadata table} that stores file listings and multiple index modalities, replacing recursive listings and broad footer scans with index-based planning \cite{hudi-metadata,onehouse-mmi}.
@@ -138,7 +138,7 @@ Hudi further supports \emph{concurrent indexing} to build large indexes online w
 
 \subsection{Organization}
 Hudi stores table metadata in an internal table co-located with the data table.
-The metadata table is a Merge-on-Read (MoR) Hudi table where each metadata or index type is a distinct partition (e.g., file listings, column statistics, bloom filters, record index, secondary and expression indexes; see Table~\ref{tab:modalities}) \cite{hudi-metadata,hudi-techspec,hudi-indexes}.
+The metadata table is a Merge-on-Read (MoR) Hudi table where each metadata or index type is a distinct partition (e.g., file listings, column statistics, bloom filters, record index, secondary and expression indexes; see Table~\ref{tab:modalities}) \cite{hudi-metadata,hudi-indexes}.
 Hudi offers two table types: Copy-on-Write (CoW), which rewrites entire files on each commit, and MoR, which appends delta logs and merges them on read or during compaction.
 MoR is the natural fit for metadata because every data commit generates metadata updates; CoW would require rewriting potentially large base files on each commit, whereas MoR amortizes this cost by buffering deltas in logs and compacting in the background \cite{hudi-metadata}.
 This mirrors database practice: the metadata table scales with the same durability, compaction, and maintenance mechanisms as the data table.
@@ -256,6 +256,8 @@ This matters for streaming and skewed workloads where file-group cardinalities v
 \subsection{Secondary index}
 The secondary index accelerates predicates on non-key columns by mapping secondary values to primary keys, then using RLI to retrieve file locations.
 Its key encoding concatenates escaped secondary and primary keys, supporting uniqueness and efficient decoding \cite{hudi-techspec}.
+The resulting two-hop lookup pattern---secondary value $\rightarrow$ record key $\rightarrow$ file location---composes with the existing record-level index rather than maintaining a separate file-location mapping.
+We evaluate secondary index performance in \S\ref{sec:eval}.
 
 \section{Concurrent Indexing}
 \label{sec:concurrent}
@@ -300,10 +302,11 @@ Rather than pausing writers to build or rebuild large indexes, Hudi supports asy
   \Description[Concurrent indexing timeline]{Swimlane timeline with two lanes: Writer lane showing four commits (c1 through c4) on a horizontal arrow, and Indexer lane below showing three phases: Schedule (dark gray, takes brief lock at commit c1), Execute (light gray, no lock, runs while c2 and c3 are committed), and Reconcile (dark gray, validates c2 and c3 under lock). A vertical dashed line marks the indexing instant.}
 \end{figure}
 
-Concurrent indexing uses a two-phase protocol (schedule/execute) that combines optimistic and multi-version concurrency control techniques:
-(1) \textbf{Scheduling} creates an indexing plan over all completed commits up to an indexing instant under a lock; and
-(2) \textbf{Execution} materializes index files and then reconciles commits that completed after the planned instant under a metadata-table lock, aborting on inconsistencies.
-Because metadata updates are transactionally coupled to data commits (\S\ref{sec:mdt}), this protocol can establish a consistent index snapshot while leaving writers unblocked.
+Concurrent indexing uses a three-phase protocol that combines optimistic and multi-version concurrency control techniques:
+(1) \textbf{Schedule} creates an indexing plan over all completed commits up to an indexing instant under a brief lock;
+(2) \textbf{Execute} materializes index files without holding any lock, allowing writers to continue committing; and
+(3) \textbf{Reconcile} acquires the metadata-table lock, validates commits that completed during execution, and applies catch-up updates, aborting on inconsistencies.
+Because metadata updates are transactionally coupled to data commits (\S\ref{sec:mdt}), this protocol can establish a consistent index snapshot while leaving writers unblocked during the expensive materialization phase.
 
 \section{Evaluation}
 \label{sec:eval}
@@ -355,6 +358,10 @@ Data shuffled & 85\,GB & 0.7\,GB (\textbf{92\% reduction}) \\
 At Uber, 19,500+ Hudi datasets span 350\,PB with 6 trillion rows ingested daily \cite{uber-hudi-blog}.
 Of these, 3,600 upsert-heavy tables (exceeding 300 billion rows) rely on the record index in production, with per-key lookup latency of 1--2\,ms from sharded HFiles \cite{uber-hudi-blog}.
 
+\paragraph{Limitations.}
+The benchmarks above use Hudi-internal published results on different Hudi versions (0.14.0 for RLI, 1.0.1 for secondary index) and do not include a head-to-head comparison with Delta Lake or Iceberg indexing mechanisms.
+Independent, version-controlled benchmarks on a shared workload suite remain important future work.
+
 \section{Discussion}
 
 All three major open table formats address the metadata bottleneck with different architectural choices.
@@ -374,10 +381,15 @@ More broadly, Hudi's design suggests that table formats will need to evolve from
 At exabyte scale, metadata management is a data-management problem.
 Hudi's metadata-as-data design stores metadata and indexes as a first-class internal MoR table, couples updates via multi-table transactions, and organizes index modalities as independently maintained partitions.
 The HFile-based layout with composite prefix keys reduces planning-time work from $O(\#\textit{table columns})$ to $O(\#\textit{query columns})$ for wide schemas, and concurrent indexing enables online backfill without pausing writers.
-Future directions include bitmap indexes for low-cardinality columns, vector indexes for embedding similarity, adaptive index selection driven by observed workload patterns, and cross-format index interoperability so that indexes can be shared across engines and table formats.
+Future directions include bitmap indexes for low-cardinality columns, vector indexes for embedding similarity, adaptive index selection driven by observed workload patterns \cite{idreos2011adaptive}, and cross-format index interoperability so that indexes can be shared across engines and table formats.
 As tables grow, metadata must be treated as managed, indexed data, and we believe the metadata-as-data pattern offers a principled foundation for this evolution.
 
-\begin{thebibliography}{16}
+\begin{thebibliography}{18}
+
+\bibitem{zaharia2021lakehouse}
+Matei Zaharia, Ali Ghodsi, Reynold Xin, and Michael Armbrust.
+\newblock {Lakehouse: A New Generation of Open Platforms that Unify Data Warehousing and Advanced Analytics}.
+\newblock In \emph{Proc.\ CIDR}, 2021.
 
 \bibitem{armbrust2020deltalake}
 Michael Armbrust et~al.
@@ -439,9 +451,9 @@ Apache Iceberg.
 
 \bibitem{uber-hudi-blog}
 Uber Engineering.
-\newblock {Apache Hudi at Uber}.
+\newblock {Apache Hudi at Uber: Engineering for Trillion-Record-Scale Data Lake Operations}.
 \newblock Uber Engineering Blog, Jan 2026.
-\newblock \url{https://www.uber.com/blog/apache-hudi/}.
+\newblock \url{https://www.uber.com/blog/apache-hudi-at-uber/}.
 
 \bibitem{bytedance-hudi-blog}
 ByteDance.
@@ -449,17 +461,20 @@ ByteDance.
 \newblock Sep 2021.
 \newblock \url{https://hudi.apache.org/blog/2021/09/01/building-eb-level-data-lake-using-hudi-at-bytedance/}.
 
-\bibitem{arrow-parquet-metadata}
-Apache Arrow Blog.
-\newblock {3x--9x Faster Parquet Footer Metadata}.
-\newblock Oct 2025.
-\newblock \url{https://arrow.apache.org/blog/2025/10/parquet-footer-metadata/}.
+\bibitem{zeng2024columnar}
+Xinyu Zeng, Yulong Hui, Jiahong Shen, Andrew Pavlo, Wes McKinney, and Huanchen Zhang.
+\newblock {An Empirical Evaluation of Columnar Storage Formats}.
+\newblock \emph{Proc. VLDB Endow.}, 17(2):148--161, 2023.
 
-\bibitem{datafusion-external-indexes}
-DataFusion Blog.
-\newblock {Using External Indexes to Accelerate Queries on Parquet}.
-\newblock Aug 2025.
-\newblock \url{https://datafusion.apache.org/blog/2025/08/external-indexes/}.
+\bibitem{liu2023openformats}
+Chunwei Liu, Anna Pavlenko, Matteo Interlandi, and Brandon Haynes.
+\newblock {A Deep Dive into Common Open Formats for Analytical DBMSs}.
+\newblock \emph{Proc. VLDB Endow.}, 16(11):3044--3056, 2023.
+
+\bibitem{idreos2011adaptive}
+Stratos Idreos, Stefan Manegold, Harumi A. Kuno, and Goetz Graefe.
+\newblock {Merging What's Cracked, Cracking What's Merged: Adaptive Indexing in Main-Memory Column-Stores}.
+\newblock \emph{Proc. VLDB Endow.}, 4(9):585--597, 2011.
 
 \bibitem{pg-expr-index}
 PostgreSQL Global Development Group.
