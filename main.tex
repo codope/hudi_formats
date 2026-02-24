@@ -59,6 +59,24 @@
 
 \usepackage{booktabs}
 \usepackage{microtype}
+\usepackage{tikz}
+\usetikzlibrary{positioning, arrows.meta, calc}
+
+% Shared TikZ styles for architecture diagrams
+\tikzset{
+  actor/.style={rectangle, rounded corners=2pt, draw, fill=gray!15,
+    font=\sffamily\scriptsize\bfseries, minimum height=5mm, inner sep=3pt},
+  tablebox/.style={rectangle, draw, fill=gray!8,
+    minimum width=0.85\columnwidth, inner sep=4pt},
+  partition/.style={rectangle, draw, fill=gray!25,
+    font=\sffamily\tiny, minimum height=4mm, inner sep=2pt},
+  arr/.style={-{Stealth[length=1.8mm]}, thick},
+  darr/.style={-{Stealth[length=1.8mm]}, thick, dashed},
+  lbl/.style={font=\sffamily\tiny, midway},
+  phase/.style={rectangle, draw, minimum height=8mm, inner sep=2pt,
+    font=\sffamily\tiny\bfseries},
+  annot/.style={font=\sffamily\tiny, text=black!70},
+}
 
 \begin{document}
 
@@ -126,20 +144,59 @@ MoR is the natural fit for metadata because every data commit generates metadata
 This mirrors database practice: the metadata table scales with the same durability, compaction, and maintenance mechanisms as the data table.
 
 \subsection{Transactional consistency}
-Hudi translates each data table write into metadata table updates and couples the two timelines so they remain in sync \cite{hudi-metadata}.
+Hudi translates each data table write into metadata table updates and couples the two timelines so they remain in sync (Figure~\ref{fig:mdt-mechanics}) \cite{hudi-metadata}.
 A write is visible only when \emph{both} the data table and metadata table are committed, preventing partial exposure of data or index state under failures \cite{onehouse-mmi}.
 
 \begin{figure}[t]
   \centering
-  \small
-  \fbox{\begin{minipage}{0.96\columnwidth}
-  \vspace{2pt}
-  \textbf{Write path.} Writers materialize data files and metadata records; a commit is visible only when both timelines complete.\\
-  \textbf{Read planning.} Planners consult only the needed partitions: \texttt{files} for listings, \texttt{column\_stats}/\texttt{partition\_stats} for pruning, and optionally \texttt{record\_index}, \texttt{secondary\_index\_*}, or \texttt{expr\_index\_*} for predicates.
-  \vspace{2pt}
-  \end{minipage}}
-  \caption{Metadata-as-data: the metadata table is an internal MoR table that is updated transactionally and consulted selectively during planning.}
+  \begin{tikzpicture}[node distance=4mm and 6mm]
+    % --- Actor nodes (placed wide apart, outside table boxes) ---
+    \node[actor] (writer) {Writer};
+    \node[actor, right=36mm of writer] (planner) {Query Planner};
+
+    % --- Data Table (explicit height for title + file groups) ---
+    \node[tablebox, minimum height=12mm,
+      below=6mm of $(writer.south)!0.5!(planner.south)$] (dt) {};
+    \node[font=\sffamily\scriptsize\bfseries, anchor=north]
+      at ([yshift=-1pt]dt.north) {Data Table};
+    \node[partition, anchor=east, yshift=-2mm] at (dt.center)
+      (fg1) {file group 1};
+    \node[partition, right=2mm of fg1] (fg2) {file group 2};
+    \node[font=\sffamily\tiny, right=1.5mm of fg2] {\dots};
+
+    % --- Metadata Table (explicit height for title + 2x3 grid) ---
+    \node[tablebox, minimum height=20mm, below=10mm of dt] (mdt) {};
+    \node[font=\sffamily\scriptsize\bfseries, anchor=north]
+      at ([yshift=-1pt]mdt.north)
+      {Metadata Table\enspace{\normalfont\sffamily\tiny(internal MoR, HFile layout)}};
+
+    % --- Partition grid (2x3) inside MDT, matching Table 1 names ---
+    \node[partition, anchor=center, yshift=-0.5mm, xshift=-12mm] at (mdt.center)
+      (p1) {files};
+    \node[partition, right=2mm of p1] (p2) {column\_stats};
+    \node[partition, right=2mm of p2] (p3) {bloom\_filters};
+    \node[partition, below=2.5mm of p1.south west, anchor=north west]
+      (p4) {record\_index};
+    \node[partition, right=2mm of p4] (p5) {secondary\_index};
+    \node[partition, right=2mm of p5] (p6) {expr\_index};
+
+    % --- Write path (left side) ---
+    \draw[arr] (writer.south) -- (writer.south |- dt.north)
+      node[lbl, right, pos=0.45] {commit};
+    \draw[darr] ([xshift=12mm]dt.south west) -- ([xshift=12mm]mdt.north west)
+      node[lbl, left] {atomic};
+
+    % --- Read path (right side, outside table boxes) ---
+    \draw[darr] ([xshift=-12mm]dt.south east) -- ([xshift=-12mm]mdt.north east)
+      node[lbl, left] {selective lookup};
+    \draw[arr] (planner.south) -- (planner.south |- dt.north)
+      node[lbl, right, pos=0.45] {plan};
+    \draw[darr] ([xshift=-10mm]mdt.north east) -- ([xshift=-10mm]dt.south east)
+      node[lbl, right] {pruned file set};
+  \end{tikzpicture}
+  \caption{Metadata-as-data architecture. Writers commit data files and metadata records atomically. Query planners selectively consult metadata-table partitions (HFile layout) to obtain pruned file sets without object-store listings.}
   \label{fig:mdt-mechanics}
+  \Description[Metadata-as-data architecture diagram]{Three-tier diagram showing Writer and Query Planner actors at the top, a Data Table in the middle containing file groups, and a Metadata Table at the bottom with six partitions (files, column stats, bloom filters, record index, secondary index, expression index). Solid arrows show the write-commit and read-plan paths; a dashed arrow shows the transactional coupling between data and metadata tables.}
 \end{figure}
 
 \subsection{HFile for point and prefix lookups}
@@ -204,7 +261,44 @@ Its key encoding concatenates escaped secondary and primary keys, supporting uni
 \label{sec:concurrent}
 
 Indexes increase write cost because they must be maintained as data changes.
-Rather than pausing writers to build or rebuild large indexes, Hudi supports asynchronous index building and \emph{concurrent indexing} \cite{hudi-indexing}.
+Rather than pausing writers to build or rebuild large indexes, Hudi supports asynchronous index building and \emph{concurrent indexing} (Figure~\ref{fig:concurrent}) \cite{hudi-indexing}.
+
+\begin{figure}[t]
+  \centering
+  \begin{tikzpicture}[x=1mm, y=1mm]
+    % --- Lane labels ---
+    \node[font=\sffamily\scriptsize\bfseries, anchor=east] at (-2,12) {Writer};
+    \node[font=\sffamily\scriptsize\bfseries, anchor=east] at (-1,0) {Indexer};
+
+    % --- Writer timeline ---
+    \draw[arr] (0,12) -- (72,12);
+
+    % --- Commit markers on writer lane ---
+    \foreach \x/\lab in {10/c_1, 26/c_2, 44/c_3, 60/c_4} {                  \fill (\x,12) circle[radius=0.9pt];                                   \node[font=\sffamily\tiny, above=1mm] at (\x,12) {$\lab$};
+    }
+
+    % --- Phase blocks on indexer lane ---
+    % Schedule phase
+    \node[phase, fill=gray!40, minimum width=12mm, anchor=west]
+      (sched) at (14,0) {Schedule};
+    \node[annot, below=0.5mm of sched] {lock; snapshot $c_1$};
+
+    % Execute phase
+    \node[phase, fill=gray!15, minimum width=22mm, anchor=west]             (exec) at (27,0) {Execute};                                         \node[annot, below=0.5mm of exec] {materialize (no lock)};
+
+    % Reconcile phase
+    \node[phase, fill=gray!40, minimum width=12mm, anchor=west]
+      (reconcile) at (50,0) {Reconcile};
+    \node[annot, below=0.5mm of reconcile] {validate $c_2$,$c_3$; lock};
+
+    % --- Vertical dashed line at indexing instant ---
+    % \draw[densely dashed, thin, gray!60] (14,14) -- (14,-6)                 node[annot, below] {indexing instant};
+    \draw[densely dashed, thin, gray!60] (14,17) -- (14,-9);              \node[annot, anchor=north] at (14,-8) {indexing instant};
+  \end{tikzpicture}
+  \caption{Concurrent indexing protocol. The indexer snapshots completed commits under a brief lock (Schedule), materializes index files while writers continue unblocked (Execute), then reconciles missed commits under a metadata-table lock (Reconcile).}
+  \label{fig:concurrent}
+  \Description[Concurrent indexing timeline]{Swimlane timeline with two lanes: Writer lane showing four commits (c1 through c4) on a horizontal arrow, and Indexer lane below showing three phases: Schedule (dark gray, takes brief lock at commit c1), Execute (light gray, no lock, runs while c2 and c3 are committed), and Reconcile (dark gray, validates c2 and c3 under lock). A vertical dashed line marks the indexing instant.}
+\end{figure}
 
 Concurrent indexing uses a two-phase protocol (schedule/execute) that combines optimistic and multi-version concurrency control techniques:
 (1) \textbf{Scheduling} creates an indexing plan over all completed commits up to an indexing instant under a lock; and
