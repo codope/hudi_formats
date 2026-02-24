@@ -196,7 +196,7 @@ A write is visible only when \emph{both} the data table and metadata table are c
   \end{tikzpicture}
   \caption{Metadata-as-data architecture. Writers commit data files and metadata records atomically. Query planners selectively consult metadata-table partitions (HFile layout) to obtain pruned file sets without object-store listings.}
   \label{fig:mdt-mechanics}
-  \Description[Metadata-as-data architecture diagram]{Three-tier diagram showing Writer and Query Planner actors at the top, a Data Table in the middle containing file groups, and a Metadata Table at the bottom with six partitions (files, column stats, bloom filters, record index, secondary index, expression index). Solid arrows show the write-commit and read-plan paths; a dashed arrow shows the transactional coupling between data and metadata tables.}
+  \Description[Metadata-as-data architecture diagram]{Three-tier diagram showing Writer and Query Planner actors at the top, a Data Table in the middle containing file groups, and a Metadata Table at the bottom with six partitions (files, column stats, bloom filters, record index, secondary index, expression index). Solid arrows connect actors to the data table; dashed arrows between the two tables show the atomic coupling, selective lookup, and pruned file-set return paths.}
 \end{figure}
 
 \subsection{HFile for point and prefix lookups}
@@ -219,17 +219,17 @@ Table~\ref{tab:modalities} summarizes key modalities and their database analogue
 \label{tab:modalities}
 \centering
 \scriptsize
-\begin{tabular}{@{}llll@{}}
+\begin{tabular}{@{}lll@{}}
 \toprule
-\textbf{MDT partition / modality} & \textbf{DB analogue} & \textbf{Lookup key (conceptual)} & \textbf{Primary effect} \\
+\textbf{MDT partition / modality} & \textbf{DB analogue} & \textbf{Primary effect} \\
 \midrule
-\texttt{record\_index} (global RLI) & primary index & record key $\rightarrow$ location & fast upserts/deletes; point lookups \\
-\texttt{secondary\_index} & secondary (inverted) index & secondary value $\rightarrow$ primary keys & accelerate predicates on non-key columns \\
-\texttt{expr\_index} & functional index & f(col) value/range & accelerate predicates on expressions; aids partition evolution \\
-\texttt{column\_stats} & zone maps / min-max stats & (col, partition, file) prefixes & file pruning via data skipping; wide-table selective reads \\
-\texttt{partition\_stats} & aggregated stats & (col, partition) & coarse partition pruning without file scans \\
-\texttt{bloom\_filters} & membership filters & (partition, file) & prune candidate files for existence checks / upserts \\
-\texttt{files} (file listings) & catalog / manifest cache & partition path $\rightarrow$ file list & avoid object-store listings; faster planning/writes \\
+\texttt{record\_index} (global RLI) & primary index & fast upserts/deletes; point lookups \\
+\texttt{secondary\_index} & secondary (inverted) index & accelerate predicates on non-key columns \\
+\texttt{expr\_index} & functional index & accelerate predicates on expressions; aids partition evolution \\
+\texttt{column\_stats} & zone maps / min-max stats & file pruning via data skipping; wide-table selective reads \\
+\texttt{partition\_stats} & aggregated stats & coarse partition pruning without file scans \\
+\texttt{bloom\_filters} & membership filters & prune candidate files for existence checks / upserts \\
+\texttt{files} (file listings) & catalog / manifest cache & avoid object-store listings; faster planning/writes \\
 \bottomrule
 \end{tabular}
 \end{table*}
@@ -292,8 +292,8 @@ Rather than pausing writers to build or rebuild large indexes, Hudi supports asy
     \node[annot, below=0.5mm of reconcile] {validate $c_2$,$c_3$; lock};
 
     % --- Vertical dashed line at indexing instant ---
-    % \draw[densely dashed, thin, gray!60] (14,14) -- (14,-6)                 node[annot, below] {indexing instant};
-    \draw[densely dashed, thin, gray!60] (14,17) -- (14,-9);              \node[annot, anchor=north] at (14,-8) {indexing instant};
+    \draw[densely dashed, thin, gray!60] (14,17) -- (14,-9);
+    \node[annot, anchor=north] at (14,-8) {indexing instant};
   \end{tikzpicture}
   \caption{Concurrent indexing protocol. The indexer snapshots completed commits under a brief lock (Schedule), materializes index files while writers continue unblocked (Execute), then reconciles missed commits under a metadata-table lock (Reconcile).}
   \label{fig:concurrent}
@@ -302,7 +302,7 @@ Rather than pausing writers to build or rebuild large indexes, Hudi supports asy
 
 Concurrent indexing uses a two-phase protocol (schedule/execute) that combines optimistic and multi-version concurrency control techniques:
 (1) \textbf{Scheduling} creates an indexing plan over all completed commits up to an indexing instant under a lock; and
-(2) \textbf{Execution} materializes index files and then validates/catches up commits that completed after the planned instant under a metadata-table lock, aborting on inconsistencies.
+(2) \textbf{Execution} materializes index files and then reconciles commits that completed after the planned instant under a metadata-table lock, aborting on inconsistencies.
 Because metadata updates are transactionally coupled to data commits (\S\ref{sec:mdt}), this protocol can establish a consistent index snapshot while leaving writers unblocked.
 
 \section{Evaluation}
@@ -367,14 +367,15 @@ Rather than a log or manifest tree, Hudi stores metadata in an internal MoR tabl
 The HFile-based layout optimizes for point and prefix lookup patterns as well as fast metadata updates, and the concurrent indexing protocol (\S\ref{sec:concurrent}) provides an explicit mechanism for building indexes online \cite{hudi-indexing}.
 This positions the metadata table not as a static manifest cache but as an extensible, lookup-oriented index structure that borrows from database indexing principles.
 In enterprise data lakes where records flow through multiple transformation stages (raw ingestion, enrichment, curated layers) with upserts at each stage, such a substrate directly reduces the cost of locating and updating records across the pipeline.
+More broadly, Hudi's design suggests that table formats will need to evolve from passive metadata stores toward active, database-style index management as workloads diversify across analytics, transactions, and AI-driven pipelines.
 
 \section{Conclusion}
 
 At exabyte scale, metadata management is a data-management problem.
 Hudi's metadata-as-data design stores metadata and indexes as a first-class internal MoR table, couples updates via multi-table transactions, and organizes index modalities as independently maintained partitions.
 The HFile-based layout with composite prefix keys reduces planning-time work from $O(\#\textit{table columns})$ to $O(\#\textit{query columns})$ for wide schemas, and concurrent indexing enables online backfill without pausing writers.
-Future directions include bitmap indexes for low-cardinality columns, vector indexes for embedding similarity, and adaptive index selection driven by observed workload patterns.
-As tables grow, metadata must be treated as managed, indexed data.
+Future directions include bitmap indexes for low-cardinality columns, vector indexes for embedding similarity, adaptive index selection driven by observed workload patterns, and cross-format index interoperability so that indexes can be shared across engines and table formats.
+As tables grow, metadata must be treated as managed, indexed data, and we believe the metadata-as-data pattern offers a principled foundation for this evolution.
 
 \begin{thebibliography}{16}
 
