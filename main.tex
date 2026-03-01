@@ -108,6 +108,10 @@ Concurrent indexing via a three-phase schedule/execute/reconcile protocol backfi
 We summarize the design and report improvements on both synthetic benchmarks (TPC-DS) and upsert-heavy workloads, demonstrating 90\% reduction in data scanned (secondary index on TPC-DS SF-1000), 72\% lower write latency and 92\% less data shuffled (record-level index on a 1\,TB upsert workload), with per-key lookup latency of 1--2\,ms at Uber's 350\,PB production scale.
 \end{abstract}
 
+
+// Need to motivate better. Lets take a look at abstract from https://vldb.org/pvldb/vol14/p3083-edara.pdf and refine our motivation.
+I don't see much around why metadata has to be treated as first class citizen.
+
 \keywords{Table formats, metadata management, adaptive indexing, point and range lookups, cloud object storage, Apache Hudi}
 
 \maketitle
@@ -135,6 +139,18 @@ Hudi further supports \emph{concurrent indexing} to build large indexes online w
 
 \section{The Metadata Table}
 \label{sec:mdt}
+
+
+// lets draw parallels from very popular systems in the introduction para. We should add references to Snowflake, Redshift, BigQuery etc, on how they manage the metadata. and Hudi's is following bringing those to lakehouses.
+// lets call out that indexing is very common technique in databases to optimize seeks for row access and to avoid scanning unnecessary data.
+// Should we add some more hightlights of the metadata table design. like serverless, distributed, Consistent (ACID guaranteed). Snapshot isolation. Built for both batch and streaming ingestion. Infinitely scalable. Performant. Debuggability.
+// Lets call out the scale to which metadata can grow? For eg, lets get details about one of the largest metadata table size in uber and quote that. This is to elucidate, that w/o metadata, serving data from the data table is close to unusable.
+// Lets see if we can all out the append only nature/design(more like change logs) of metadata updates so as not to incur latencies to data table ingestion writers. I do see we have covered something on these lines in 2.1, but just wanted to call it out.
+// Also, can we call out somewhere that, metadata is expected to reduce the amount of data scanned from data table, not necessarily give you the exact data files to be looked up. Based on the
+// indexes being used, some additional data files could also be returned (corase grained indexes like col stats), but it is always guaranteed to ensure data consistency.
+// Do we have space to call out "falsifiable expression" that we could see here https://vldb.org/pvldb/vol14/p3083-edara.pdf. We use similar technique in our col stats pruning.
+
+
 
 \subsection{Organization}
 Hudi stores table metadata in an internal table co-located with the data table.
@@ -204,7 +220,7 @@ Lakehouse metadata access is dominated by \emph{point} and \emph{prefix} lookups
 Hudi stores metadata partitions in an SSTable-like format (HFile), maintaining records in sorted order with a block index for point reads and range scans \cite{hudi-techspec}.
 Published experiments report 10--100$\times$ lower point-lookup latency for HFile compared to Parquet/Avro at 10M-entry scale \cite{onehouse-mmi}.
 
-\paragraph{Prefix key design for wide tables.}
+\paragraph{Prefix key design for wide tables:}
 For column statistics, Hudi composes record keys by concatenating \emph{column name}, \emph{partition name}, and \emph{data file name}, enabling prefix scans.
 Planners issue prefix lookups only for columns referenced by a query, reducing work from $O(\#\textit{table columns})$ to $O(\#\textit{query columns})$ \cite{onehouse-mmi}.
 
@@ -244,7 +260,7 @@ We evaluate RLI performance on upsert workloads in \S\ref{sec:eval}.
 An expression index indexes a function of a column, stored as an \texttt{expr\_index} partition \cite{hudi-indexes,hudi-techspec}.
 This is the lakehouse analogue of indexes on expressions in PostgreSQL \cite{pg-expr-index}: it creates an access path for predicates that do not match raw columns.
 
-\paragraph{Partition evolution.}
+\paragraph{Partition evolution:}
 The expression index also enables the partition evolution use case. Physical partitioning is a coarse-grained index; a table partitioned by day (e.g., \texttt{dt=YYYY-MM-DD}) cannot prune at finer granularity without repartitioning.
 An expression index over an hour-extraction function provides fine-grained file pruning by hour predicates without changing the physical layout \cite{hudi-techspec,hudi-indexes}.
 
@@ -318,6 +334,9 @@ Both benchmarks use Amazon EMR clusters.
 The secondary index benchmark uses Hudi 1.0.1 with Spark 3.5.5 on 10 \texttt{m5.xlarge} instances \cite{hudi-secondary-index-blog}.
 The RLI benchmark uses Hudi 0.14.0 with Spark 3.2.1 on 10 \texttt{m5.4xlarge} instances over a 1\,TB dataset (2 billion records) \cite{hudi-rli-blog}.
 
+// we need to revist this once we have nos from uber. Either it will be GCS or hdfs (RLI nos)
+// Also for SI, let me collect the info from aditya. likely its EKS and not EMR.
+
 \paragraph{Secondary index.}
 On TPC-DS SF-1000, a secondary index on the \texttt{ship\_customer\_sk} column in the \texttt{web\_sales} fact table reduces scanned data by 90\% and improves warm-run latency by 58\% (Table~\ref{tab:tpcds}).
 
@@ -380,9 +399,11 @@ More broadly, Hudi's design suggests that table formats will need to evolve from
 
 At exabyte scale, metadata management is a data-management problem.
 Hudi's metadata-as-data design stores metadata and indexes as a first-class internal MoR table, couples updates via multi-table transactions, and organizes index modalities as independently maintained partitions.
-The HFile-based layout with composite prefix keys reduces planning-time work from $O(\#\textit{table columns})$ to $O(\#\textit{query columns})$ for wide schemas, and concurrent indexing enables online backfill without pausing writers.
+The HFile-based layout with composite prefix keys reduces planning-time work from $O(\#\textit{table columns})$ to $O(\#\textit{query columns})$  (do we really need to stress on this again in the conclusion? not all indexes follow this pattern right? for eg, incase of RLI, its different.) for wide schemas, and concurrent indexing enables online backfill without pausing writers.
 Future directions include bitmap indexes for low-cardinality columns, vector indexes for embedding similarity, adaptive index selection driven by observed workload patterns \cite{idreos2011adaptive}, and cross-format index interoperability so that indexes can be shared across engines and table formats.
 As tables grow, metadata must be treated as managed, indexed data, and we believe the metadata-as-data pattern offers a principled foundation for this evolution.
+
+// For future work, can we also call out we plan to enhance how different indexes are used or chosen during query pruning. i.e. which index to use for a given query is not very intelligent as of now.
 
 \begin{thebibliography}{18}
 
