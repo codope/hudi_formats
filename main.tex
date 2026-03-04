@@ -100,11 +100,10 @@
 \email{second.author@domain.com}
 
 \begin{abstract}
-As lakehouse tables scale toward millions of files and partitions, metadata operations become a first-order cost.
-Apache Hudi treats \emph{metadata as data}: an internal metadata table (itself a Merge-on-Read table) whose partitions implement a multi-modal indexing subsystem encompassing file listings, column statistics, bloom filters, record-level, secondary, and expression indexes.
-Data and metadata updates are coupled via multi-table transactions so that commits are visible only when both tables are committed.
-To serve point and prefix lookups efficiently on object storage, Hudi stores metadata partitions in an SSTable-like layout (HFile) with composite keys that enable prefix scans over only the columns needed for planning.
-Concurrent indexing via a three-phase schedule/execute/reconcile protocol backfills large indexes online while writers continue to commit.
+As lakehouse tables scale toward millions of files and partitions, metadata itself becomes big data.
+Traditional big data systems try to reduce metadata to keep management tractable, compromising query performance; cloud data warehouses like Snowflake, BigQuery, and Redshift instead treat metadata as a managed, indexed structure---but within proprietary architectures.
+Apache Hudi brings this principle to the open lakehouse, treating \emph{metadata as data}: an internal Merge-on-Read table whose partitions implement a multi-modal indexing subsystem---column statistics, bloom filters, record-level, secondary, and expression indexes---all transactionally coupled with data commits and stored in an SSTable-like layout (HFile) optimized for the point and prefix lookups that dominate query planning.
+Concurrent indexing via a three-phase protocol backfills large indexes online while writers continue to commit.
 We summarize the design and report improvements on both synthetic benchmarks (TPC-DS) and upsert-heavy workloads, demonstrating 90\% reduction in data scanned (secondary index on TPC-DS SF-1000), 72\% lower write latency and 92\% less data shuffled (record-level index on a 1\,TB upsert workload), with per-key lookup latency of 1--2\,ms at Uber's 350\,PB production scale.
 \end{abstract}
 
@@ -113,6 +112,7 @@ We summarize the design and report improvements on both synthetic benchmarks (TP
 \maketitle
 
 \section{Introduction}
+\label{sec:intro}
 
 Open table formats have become the transactional layer for lakehouse deployments on cloud object storage \cite{zaharia2021lakehouse}.
 At large scale, metadata becomes the bottleneck: directory listings and bulk footer/stat reads dominate planning latency and API cost \cite{armbrust2020deltalake}.
@@ -138,10 +138,13 @@ Hudi further supports \emph{concurrent indexing} to build large indexes online w
 
 \subsection{Organization}
 Hudi stores table metadata in an internal table co-located with the data table.
-The metadata table is a Merge-on-Read (MoR) Hudi table where each metadata or index type is a distinct partition (e.g., file listings, column statistics, bloom filters, record index, secondary and expression indexes; see Table~\ref{tab:modalities}) \cite{hudi-metadata,hudi-indexes}.
-Hudi offers two table types: Copy-on-Write (CoW), which rewrites entire files on each commit, and MoR, which appends delta logs and merges them on read or during compaction.
-MoR is the natural fit for metadata because every data commit generates metadata updates; CoW would require rewriting potentially large base files on each commit, whereas MoR amortizes this cost by buffering deltas in logs and compacting in the background \cite{hudi-metadata}.
-This mirrors database practice: the metadata table scales with the same durability, compaction, and maintenance mechanisms as the data table.
+Cloud data warehouses have long recognized the value of managed metadata: Snowflake maintains per-micro-partition zone maps in a dedicated metadata service \cite{dageville2016snowflake}, BigQuery stores fine-grained column and block statistics as distributed system tables \cite{edara2021bigmetadata}, and Redshift keeps in-memory zone maps with automatic sort-key optimization \cite{armenatzoglou2022redshift}.
+These are all proprietary, tightly coupled to their respective engines.
+Hudi brings the same principle to the open lakehouse: its metadata table requires no external servers, provides ACID guarantees via multi-table transactions, and serves both batch and streaming ingestion paths.
+
+The metadata table is a Merge-on-Read (MoR) Hudi table where each metadata or index type is a distinct partition (see Table~\ref{tab:modalities}) \cite{hudi-metadata,hudi-indexes}.
+MoR is the natural fit because every data commit generates metadata updates; rather than rewriting base files on each commit, MoR appends delta logs and compacts in the background \cite{hudi-metadata}.
+Metadata updates are thus appended as delta logs rather than rewriting base files, ensuring that data-table ingestion latency is not penalized by metadata maintenance.
 
 \subsection{Transactional consistency}
 Hudi translates each data table write into metadata table updates and couples the two timelines so they remain in sync (Figure~\ref{fig:mdt-mechanics}) \cite{hudi-metadata}.
@@ -168,7 +171,7 @@ A write is visible only when \emph{both} the data table and metadata table are c
     \node[tablebox, minimum height=20mm, below=10mm of dt] (mdt) {};
     \node[font=\sffamily\scriptsize\bfseries, anchor=north]
       at ([yshift=-1pt]mdt.north)
-      {Metadata Table\enspace{\normalfont\sffamily\tiny(internal MoR, HFile layout)}};
+      {Metadata Table\enspace{\normalfont\sffamily\tiny(internal Merge-on-Read table)}};
 
     % --- Partition grid (2x3) inside MDT, matching Table 1 names ---
     \node[partition, anchor=center, yshift=-0.5mm, xshift=-12mm] at (mdt.center)
@@ -194,7 +197,7 @@ A write is visible only when \emph{both} the data table and metadata table are c
     \draw[darr] ([xshift=-10mm]mdt.north east) -- ([xshift=-10mm]dt.south east)
       node[lbl, right] {pruned file set};
   \end{tikzpicture}
-  \caption{Metadata-as-data architecture. Writers commit data files and metadata records atomically. Query planners selectively consult metadata-table partitions (HFile layout) to obtain pruned file sets without object-store listings.}
+  \caption{Metadata-as-data architecture. Writers commit data files and metadata records atomically. Query planners selectively consult metadata-table partitions to obtain pruned file sets without object-store listings.}
   \label{fig:mdt-mechanics}
   \Description[Metadata-as-data architecture diagram]{Three-tier diagram showing Writer and Query Planner actors at the top, a Data Table in the middle containing file groups, and a Metadata Table at the bottom with six partitions (files, column stats, bloom filters, record index, secondary index, expression index). Solid arrows connect actors to the data table; dashed arrows between the two tables show the atomic coupling, selective lookup, and pruned file-set return paths.}
 \end{figure}
@@ -203,6 +206,7 @@ A write is visible only when \emph{both} the data table and metadata table are c
 Lakehouse metadata access is dominated by \emph{point} and \emph{prefix} lookups (e.g., ``stats for column \texttt{c} in file \texttt{f}'', ``all blooms for partition \texttt{p}'').
 Hudi stores metadata partitions in an SSTable-like format (HFile), maintaining records in sorted order with a block index for point reads and range scans \cite{hudi-techspec}.
 Published experiments report 10--100$\times$ lower point-lookup latency for HFile compared to Parquet/Avro at 10M-entry scale \cite{onehouse-mmi}.
+At Uber, the metadata table is deployed across 90\% of production datasets; for the largest tables exceeding 300 billion rows, the record index alone is sharded into up to 10,000 HFiles \cite{uber-hudi-blog}.
 
 \paragraph{Prefix key design for wide tables.}
 For column statistics, Hudi composes record keys by concatenating \emph{column name}, \emph{partition name}, and \emph{data file name}, enabling prefix scans.
@@ -239,6 +243,13 @@ The record-level index (RLI) maps record keys to data-table locations in the \te
 This is the lakehouse analogue of a \emph{primary index}: it enables efficient upserts and deletes by avoiding full file-group scans to locate candidate records.
 To accommodate large key spaces, the record index uses hash-based sharding and supports point lookups for keyed reads \cite{hudi-indexes,hudi-rli-blog}.
 We evaluate RLI performance on upsert workloads in \S\ref{sec:eval}.
+
+\subsection{Column statistics and data skipping}
+The \texttt{column\_stats} partition stores per-file, per-column aggregates (min, max, null count, value count) in the metadata table.
+During query planning, the planner evaluates query predicates against these statistics: if a file's stored range provably falsifies a predicate (e.g., a file's \texttt{max(age)} is 30 but the query requests \texttt{age > 50}), the file is skipped entirely.
+This technique---evaluating predicates against precomputed column statistics to eliminate files---is widely used in cloud data warehouses under names such as zone maps, small materialized aggregates, and block pruning \cite{dageville2016snowflake,edara2021bigmetadata,armenatzoglou2022redshift}.
+Column-statistics-based pruning is coarse-grained: it guarantees that no relevant data is missed (no false negatives), but may include files whose ranges overlap the predicate without containing matching records (false positives).
+Combined with bloom filters and secondary indexes, these coarse and fine-grained modalities compose to progressively narrow the candidate file set.
 
 \subsection{Expression index}
 An expression index indexes a function of a column, stored as an \texttt{expr\_index} partition \cite{hudi-indexes,hudi-techspec}.
@@ -355,8 +366,7 @@ Data shuffled & 85\,GB & 0.7\,GB (\textbf{92\% reduction}) \\
 \end{table}
 
 \paragraph{Production evidence.}
-At Uber, 19,500+ Hudi datasets span 350\,PB with 6 trillion rows ingested daily \cite{uber-hudi-blog}.
-Of these, 3,600 upsert-heavy tables (exceeding 300 billion rows) rely on the record index in production, with per-key lookup latency of 1--2\,ms from sharded HFiles \cite{uber-hudi-blog}.
+Of Uber's 19,500+ Hudi datasets (\S\ref{sec:intro}), 3,600 upsert-heavy tables rely on the record index in production, with per-key lookup latency of 1--2\,ms from sharded HFiles \cite{uber-hudi-blog}.
 
 \paragraph{Limitations.}
 The benchmarks above use Hudi-internal published results on different Hudi versions (0.14.0 for RLI, 1.0.1 for secondary index) and do not include a head-to-head comparison with Delta Lake or Iceberg indexing mechanisms.
@@ -380,11 +390,11 @@ More broadly, Hudi's design suggests that table formats will need to evolve from
 
 At exabyte scale, metadata management is a data-management problem.
 Hudi's metadata-as-data design stores metadata and indexes as a first-class internal MoR table, couples updates via multi-table transactions, and organizes index modalities as independently maintained partitions.
-The HFile-based layout with composite prefix keys reduces planning-time work from $O(\#\textit{table columns})$ to $O(\#\textit{query columns})$ for wide schemas, and concurrent indexing enables online backfill without pausing writers.
-Future directions include bitmap indexes for low-cardinality columns, vector indexes for embedding similarity, adaptive index selection driven by observed workload patterns \cite{idreos2011adaptive}, and cross-format index interoperability so that indexes can be shared across engines and table formats.
+The metadata table storage format optimizes for the point and prefix lookup patterns that dominate lakehouse query planning, and concurrent indexing enables online backfill without pausing writers.
+Future directions include bitmap indexes for low-cardinality columns, vector indexes for embedding similarity, cost-based index selection based on predicate selectivity and index maintenance cost, and cross-format index interoperability so that indexes can be shared across engines and table formats.
 As tables grow, metadata must be treated as managed, indexed data, and we believe the metadata-as-data pattern offers a principled foundation for this evolution.
 
-\begin{thebibliography}{18}
+\begin{thebibliography}{19}
 
 \bibitem{zaharia2021lakehouse}
 Matei Zaharia, Ali Ghodsi, Reynold Xin, and Michael Armbrust.
@@ -401,25 +411,35 @@ Pavan Edara and Mosha Pasumansky.
 \newblock {Big Metadata: When Metadata is Big Data}.
 \newblock \emph{Proc. VLDB Endow.}, 14(12):3083--3095, 2021.
 
+\bibitem{dageville2016snowflake}
+Beno\^{i}t Dageville, Thierry Cruanes, Marcin Zukowski, Vadim Antonov, Artin Avanes, Jon Bock, Jonathan Claybaugh, Daniel Engovatov, Martin Hentschel, Jiansheng Huang, Allison~W. Lee, Ashish Motivala, Abdul~Q. Munir, Steven Pelley, Peter Povinec, Greg Rahn, Spyridon Triantafyllis, and Philipp Unterbrunner.
+\newblock {The Snowflake Elastic Data Warehouse}.
+\newblock In \emph{Proc.\ ACM SIGMOD}, pages 215--226, 2016.
+
+\bibitem{armenatzoglou2022redshift}
+Nikos Armenatzoglou, Sanuj Basu, Naga Bhanoori, Mengchu Cai, Naresh Chainani, Kiran Chinta, Venkatraman Govindaraju, Todd~J. Green, Monish Gupta, Sebastian Hillig, Eric Hotinger, Yan Leshinsky, Jintian Liang, Michael McCreedy, Fabian Nagel, Ippokratis Pandis, Panos Parchas, Rahul Pathak, Orestis Polychroniou, Foyzur Rahman, Gaurav Saxena, Gokul Soundararajan, Sriram Subramanian, and Doug Terry.
+\newblock {Amazon Redshift Re-invented}.
+\newblock In \emph{Proc.\ ACM SIGMOD}, pages 2205--2217, 2022.
+
 \bibitem{hudi-metadata}
 Apache Hudi.
 \newblock {Table Metadata (Documentation)}.
-\newblock \url{https://hudi.apache.org/docs/metadata/}.
+\newblock \url{https://hudi.apache.org/docs/metadata}.
 
 \bibitem{hudi-indexes}
 Apache Hudi.
 \newblock {Indexes (Documentation)}.
-\newblock \url{https://hudi.apache.org/docs/indexes/}.
+\newblock \url{https://hudi.apache.org/docs/indexes}.
 
 \bibitem{hudi-indexing}
 Apache Hudi.
-\newblock {Indexing and Concurrent Indexing (Documentation)}.
-\newblock \url{https://hudi.apache.org/docs/metadata_indexing/}.
+\newblock {Concurrent Indexing (Documentation)}.
+\newblock \url{https://hudi.apache.org/docs/metadata_indexing}.
 
 \bibitem{hudi-techspec}
 Apache Hudi.
 \newblock {Apache Hudi Technical Specification 1.0}.
-\newblock \url{https://hudi.apache.org/learn/tech-specs-1point0/}.
+\newblock \url{https://hudi.apache.org/learn/tech-specs-1point0}.
 
 \bibitem{onehouse-mmi}
 Sivabalan Narayanan and Ethan Guo.
@@ -431,13 +451,13 @@ Sivabalan Narayanan and Ethan Guo.
 Nishant Patel and Sivasubramanian S.
 \newblock {Record Level Index: Hudi's blazing fast indexing for large-scale datasets}.
 \newblock Apache Hudi Blog, Nov 1, 2023.
-\newblock \url{https://hudi.apache.org/blog/2023/11/01/record-level-index/}.
+\newblock \url{https://hudi.apache.org/blog/2023/11/01/record-level-index}.
 
 \bibitem{hudi-secondary-index-blog}
 Dipankar Mazumdar and Aditya Goenka.
 \newblock {Introducing Secondary Index in Apache Hudi Lakehouse Platform}.
 \newblock Apache Hudi Blog, Apr 2, 2025.
-\newblock \url{https://hudi.apache.org/blog/2025/04/02/secondary-index/}.
+\newblock \url{https://hudi.apache.org/blog/2025/04/02/secondary-index}.
 
 \bibitem{delta-protocol}
 Delta Lake.
@@ -447,19 +467,19 @@ Delta Lake.
 \bibitem{iceberg-spec}
 Apache Iceberg.
 \newblock {Apache Iceberg Table Format Specification}.
-\newblock \url{https://iceberg.apache.org/spec/}.
+\newblock \url{https://iceberg.apache.org/spec}.
 
 \bibitem{uber-hudi-blog}
 Uber Engineering.
 \newblock {Apache Hudi at Uber: Engineering for Trillion-Record-Scale Data Lake Operations}.
 \newblock Uber Engineering Blog, Jan 2026.
-\newblock \url{https://www.uber.com/blog/apache-hudi-at-uber/}.
+\newblock \url{https://www.uber.com/blog/apache-hudi-at-uber}.
 
 \bibitem{bytedance-hudi-blog}
 ByteDance.
 \newblock {Building EB-Level Data Lake Using Apache Hudi at ByteDance}.
 \newblock Sep 2021.
-\newblock \url{https://hudi.apache.org/blog/2021/09/01/building-eb-level-data-lake-using-hudi-at-bytedance/}.
+\newblock \url{https://hudi.apache.org/blog/2021/09/01/building-eb-level-data-lake-using-hudi-at-bytedance}.
 
 \bibitem{zeng2024columnar}
 Xinyu Zeng, Yulong Hui, Jiahong Shen, Andrew Pavlo, Wes McKinney, and Huanchen Zhang.
@@ -470,11 +490,6 @@ Xinyu Zeng, Yulong Hui, Jiahong Shen, Andrew Pavlo, Wes McKinney, and Huanchen Z
 Chunwei Liu, Anna Pavlenko, Matteo Interlandi, and Brandon Haynes.
 \newblock {A Deep Dive into Common Open Formats for Analytical DBMSs}.
 \newblock \emph{Proc. VLDB Endow.}, 16(11):3044--3056, 2023.
-
-\bibitem{idreos2011adaptive}
-Stratos Idreos, Stefan Manegold, Harumi A. Kuno, and Goetz Graefe.
-\newblock {Merging What's Cracked, Cracking What's Merged: Adaptive Indexing in Main-Memory Column-Stores}.
-\newblock \emph{Proc. VLDB Endow.}, 4(9):585--597, 2011.
 
 \bibitem{pg-expr-index}
 PostgreSQL Global Development Group.
