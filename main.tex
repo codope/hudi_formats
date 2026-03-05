@@ -60,7 +60,7 @@
 \usepackage{booktabs}
 \usepackage{microtype}
 \usepackage{tikz}
-\usetikzlibrary{positioning, arrows.meta, calc}
+\usetikzlibrary{positioning, arrows.meta, calc, decorations.pathreplacing}
 
 % Shared TikZ styles for architecture diagrams
 \tikzset{
@@ -82,29 +82,36 @@
 
 \title{Metadata-as-Data in Apache Hudi: A Multi-Modal Index Substrate for Lakehouse Tables}
 
-% TODO: Replace with the final author list (single-anonymous: include authors + affiliations).
-\author{First Author}
+\author{Prashant Wason}
 \affiliation{%
-  \institution{Apache Hudi (PMC), Organization}
-  \city{City}
-  \country{Country}
+  \institution{Apache Hudi PMC and Uber}
+  \city{San Francisco}
+  \country{USA}
 }
 \email{first.author@domain.com}
 
-\author{Second Author}
+\author{Sagar Sumit}
 \affiliation{%
-  \institution{Organization}
-  \city{City}
-  \country{Country}
+  \institution{Apache Hudi PMC and Anyscale}
+  \city{Bengaluru}
+  \country{India}
 }
-\email{second.author@domain.com}
+\email{codope@apache.org}
+
+\author{Sivabalan Narayanan}
+\affiliation{%
+  \institution{Apache Hudi PMC and Onehouse}
+  \city{San Francisco}
+  \country{USA}
+}
+\email{first.author@domain.com}
 
 \begin{abstract}
 As lakehouse tables scale toward millions of files and partitions, metadata itself becomes big data.
 Traditional big data systems try to reduce metadata to keep management tractable, compromising query performance; cloud data warehouses like Snowflake, BigQuery, and Redshift instead treat metadata as a managed, indexed structure---but within proprietary architectures.
 Apache Hudi brings this principle to the open lakehouse, treating \emph{metadata as data}: an internal Merge-on-Read table whose partitions implement a multi-modal indexing subsystem---column statistics, bloom filters, record-level, secondary, and expression indexes---all transactionally coupled with data commits and stored in an SSTable-like layout (HFile) optimized for the point and prefix lookups that dominate query planning.
 Concurrent indexing via a three-phase protocol backfills large indexes online while writers continue to commit.
-We summarize the design and report improvements on both synthetic benchmarks (TPC-DS) and upsert-heavy workloads, demonstrating 90\% reduction in data scanned (secondary index on TPC-DS SF-1000), 72\% lower write latency and 92\% less data shuffled (record-level index on a 1\,TB upsert workload), with per-key lookup latency of 1--2\,ms at Uber's 350\,PB production scale.
+We summarize the design and report improvements on both synthetic benchmarks (TPC-DS) and Uber production workloads, demonstrating 90\% reduction in data scanned (secondary index on TPC-DS SF-1000), record-level index lookups 64$\times$ faster than global simple index at 36\,billion-row scale with sub-millisecond per-key latency even at 400\,billion+ rows, and 72\% lower write latency on upsert workloads.
 \end{abstract}
 
 \begin{CCSXML}
@@ -146,11 +153,9 @@ Cloud data warehouses have long recognized the value of managed metadata: Snowfl
 Hudi brings this principle to the open lakehouse: each table maintains an internal \emph{metadata table}, co-located with data files, that stores file listings and multiple index modalities---replacing recursive listings and broad footer scans with index-based planning \cite{hudi-metadata,onehouse-mmi}.
 Hudi further supports \emph{concurrent indexing} to build large indexes online without pausing ingestion \cite{hudi-indexing}.
 
-\textbf{Contributions.}\\
-(1) Hudi's metadata-as-data design: an internal Hudi table that functions as an extensible multi-modal index substrate, with HFile-based layout and composite prefix keys (\S\ref{sec:mdt}).\\
-(2) Multi-modal indexing modalities (record-level, secondary, expression, bloom) materialized as independently managed partitions (\S\ref{sec:modalities}).\\
-(3) A concurrent indexing protocol that builds indexes online without pausing writers (\S\ref{sec:concurrent}).\\
-(4) Evaluation on TPC-DS (secondary index) and upsert-heavy workloads (record-level index), with production evidence from Uber-scale deployments (\S\ref{sec:eval}).
+\textbf{Contributions.}
+We present a metadata-as-data architecture for open table formats: an internal MoR table whose partitions form a multi-modal index substrate with an HFile-based layout optimized for point and prefix lookups, and a concurrent indexing protocol that builds indexes online without blocking writers.
+We evaluate on TPC-DS and Uber production tables at up to 400\,billion+ rows.
 
 \section{The Metadata Table}
 \label{sec:mdt}
@@ -179,7 +184,6 @@ A write is visible only when \emph{both} the data table and metadata table are c
     \node[partition, anchor=east, yshift=-2mm] at (dt.center)
       (fg1) {Parquet base files};
     \node[partition, right=2mm of fg1] (fg2) {delta logs};
-    \node[font=\sffamily\tiny, right=1.5mm of fg2] {\dots};
 
     % --- Metadata Table (containing box with title + 2x3 partition grid) ---
     \node[tablebox, minimum height=28mm, below=8mm of dt] (mdt) {};
@@ -221,7 +225,7 @@ A write is visible only when \emph{both} the data table and metadata table are c
     \draw[darr] ([xshift=-12mm]dt.south east) -- ([xshift=-12mm]mdt.north east)
       node[lbl, left] {selective lookup};
     \draw[darr] ([xshift=-10mm]mdt.north east) -- ([xshift=-10mm]dt.south east)
-      node[lbl, right] {pruned files set};
+      node[lbl, right] {pruned file set};
   \end{tikzpicture}
   \caption{Metadata-as-data architecture and index substrate. Writers atomically commit data and metadata; query planners selectively consult metadata-table partitions for pruned file sets. Left column accelerates planning/pruning; right column accelerates writes and point lookups. Each partition uses sorted HFiles with composite prefix keys.}
   \label{fig:mdt-partitions-keys}
@@ -236,7 +240,56 @@ At Uber, the metadata table is deployed across 90\% of production datasets; for 
 
 \paragraph{Prefix key design for wide tables.}
 For column statistics, Hudi composes record keys by concatenating \emph{column name}, \emph{partition name}, and \emph{data file name}, enabling prefix scans.
-Planners issue prefix lookups only for columns referenced by a query, reducing work from $O(\#\textit{table columns})$ to $O(\#\textit{query columns})$ \cite{onehouse-mmi}.
+Planners issue prefix lookups only for columns referenced by a query, reducing work from $O(\#\textit{table columns})$ to $O(\#\textit{query columns})$ (Figure~\ref{fig:prefix-scan}) \cite{onehouse-mmi}.
+
+\begin{figure}[t]
+  \centering
+  \begin{tikzpicture}[node distance=1.5mm]
+    \tikzset{
+      entry/.style={font=\ttfamily\tiny, anchor=west},
+      hlight/.style={entry, fill=gray!20},
+      boxtitle/.style={font=\sffamily\scriptsize\bfseries},
+    }
+
+    % Outer box
+    \node[tablebox, minimum width=0.55\columnwidth, minimum height=40mm,
+      inner sep=3pt] (box) {};
+    \node[boxtitle, anchor=north] at ([yshift=-1pt]box.north)
+      {column\_stats partition (sorted HFile)};
+
+    % Entries — non-highlighted (top)
+    \node[entry] (e1) at ([xshift=3mm, yshift=-5mm]box.north west)
+      {[col1][part1][file1] = stats};
+    \node[entry, below=0.5mm of e1] (e2) {[col1][part1][file2] = stats};
+    \node[entry, below=0.5mm of e2] (e3) {[col1][part2][file5] = stats};
+
+    % Highlighted prefix range
+    \node[hlight, below=1mm of e3] (h1) {[col2][part1][file1] = stats};
+    \node[hlight, below=0.5mm of h1] (h2) {[col2][part1][file3] = stats};
+    \node[hlight, below=0.5mm of h2] (h3) {[col2][part2][file5] = stats};
+    \node[hlight, below=0.5mm of h3] (h4) {[col2][part2][file6] = stats};
+
+    % Non-highlighted (bottom)
+    \node[entry, below=1mm of h4] (e4) {[col3][part1][file1] = stats};
+    \node[font=\tiny, below=0.5mm of e4, anchor=west] (dots) {\dots};
+
+    % Brace for highlighted range
+    \draw[decorate, decoration={brace, amplitude=3pt, mirror}]
+      ([xshift=-1.5mm]h1.north west) -- ([xshift=-1.5mm]h4.south west)
+      node[midway, left=3pt, font=\sffamily\tiny, align=right]
+      {prefix scan\\on \texttt{col2}};
+
+    % Annotation arrow
+    \draw[-{Stealth[length=1.5mm]}, thick, dashed]
+      ([xshift=2mm]box.east |- h2.east) -- ++(10mm,0)
+      node[right, font=\sffamily\tiny, align=left]
+      {read only matching\\entries, then filter\\on min/max stats};
+
+  \end{tikzpicture}
+  \caption{Prefix scan on \texttt{column\_stats}. Keys are sorted by column/partition/file; a query referencing \texttt{col2} range-reads only that prefix, skipping all other columns.}
+  \label{fig:prefix-scan}
+  \Description[Column stats prefix scan]{Sorted key-value entries in the column\_stats HFile partition. A prefix scan on col2 highlights only the entries matching that column prefix, skipping entries for col1, col3 through col100.}
+\end{figure}
 
 \section{Multi-Modal Indexing}
 \label{sec:modalities}
@@ -344,12 +397,11 @@ Because metadata updates are transactionally coupled to data commits (\S\ref{sec
 \section{Evaluation}
 \label{sec:eval}
 
-We report published benchmark results for two index modalities and summarize production evidence from Uber-scale deployments.
+We report benchmark results for two index modalities and summarize production evidence from Uber-scale deployments.
 
 \paragraph{Setup.}
-Both benchmarks use Amazon EMR clusters.
-The secondary index benchmark uses Hudi 1.0.1 with Spark 3.5.5 on 10 \texttt{m5.xlarge} instances \cite{hudi-secondary-index-blog}.
-The RLI benchmark uses Hudi 0.14.0 with Spark 3.2.1 on 10 \texttt{m5.4xlarge} instances over a 1\,TB dataset (2 billion records) \cite{hudi-rli-blog}.
+The secondary index benchmark uses Hudi 1.0.1 with Spark 3.5.5 on 10 \texttt{m5.xlarge} Amazon EMR instances \cite{hudi-secondary-index-blog}.
+The RLI lookup benchmark uses Spark with 1,000 executors on Uber production tables stored on GCS, comparing record-level index against global simple index (which joins incoming keys against all file groups, effectively a full scan).
 
 \paragraph{Secondary index.}
 On TPC-DS SF-1000, a secondary index on the \texttt{ship\_customer\_sk} column in the \texttt{web\_sales} fact table reduces scanned data by 90\% and improves warm-run latency by 58\% (Table~\ref{tab:tpcds}).
@@ -370,19 +422,22 @@ With secondary index & 22 & 6 & 7 & 521 \\
 \end{table}
 
 \paragraph{Record-level index.}
-On the 1\,TB upsert workload, RLI reduces write latency by 72\% and data shuffled during upserts by 92\% compared to a global simple index that scans all file groups (Table~\ref{tab:rli}).
+Global simple index joins incoming keys against every file group, so its cost grows with table size.
+RLI resolves keys via point lookups into sharded HFiles (Table~\ref{tab:rli}): at 36B rows the speedup is 64$\times$, and at 400B+ rows RLI maintains sub-millisecond per-key latency while global simple fails to complete.
+On a separate 1\,TB upsert workload, RLI also reduces write latency by 72\% and data shuffled by 92\% \cite{hudi-rli-blog}.
 
 \begin{table}[t]
-\caption{Record-level index benchmark on 1\,TB (2B records). Results from \cite{hudi-rli-blog}.}
+\caption{Record-level index lookup on Uber production tables (100K-key batches). Global simple did not complete on the 400B+ table.}
 \label{tab:rli}
 \centering
 \small
-\begin{tabular}{@{}lrr@{}}
+\begin{tabular}{@{}lrrr@{}}
 \toprule
-\textbf{Metric} & \textbf{Global Simple} & \textbf{Record Index} \\
+\textbf{Records} & \textbf{Record Index} & \textbf{Global Simple} & \textbf{Speedup} \\
 \midrule
-Write latency (relative) & 1.0$\times$ & 0.28$\times$ (\textbf{72\% reduction}) \\
-Data shuffled & 85\,GB & 0.7\,GB (\textbf{92\% reduction}) \\
+1.5B  & 0.14\,ms/key & 0.90\,ms/key & 6$\times$ \\
+36B   & 0.45\,ms/key & 29.0\,ms/key & 64$\times$ \\
+400B+ & 0.89\,ms/key & \multicolumn{2}{c}{\textemdash\ (did not complete)} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -391,8 +446,8 @@ Data shuffled & 85\,GB & 0.7\,GB (\textbf{92\% reduction}) \\
 Of Uber's 19,500+ Hudi datasets (\S\ref{sec:intro}), 3,600 upsert-heavy tables rely on the record index in production, with per-key lookup latency of 1--2\,ms from sharded HFiles \cite{uber-hudi-blog}.
 
 \paragraph{Limitations.}
-The benchmarks above use Hudi-internal published results on different Hudi versions (0.14.0 for RLI, 1.0.1 for secondary index) and do not include a head-to-head comparison with Delta Lake or Iceberg indexing mechanisms.
-Independent, version-controlled benchmarks on a shared workload suite remain important future work.
+The benchmarks do not include a head-to-head comparison with Delta Lake or Iceberg indexing mechanisms.
+Independent benchmarks on a shared workload suite remain important future work.
 
 \section{Discussion}
 
