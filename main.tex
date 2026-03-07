@@ -145,11 +145,12 @@ Production deployments underscore the magnitude: Uber manages 19,500+ datasets (
 As systems reach this scale, metadata requires database-style techniques for storage, indexing, and maintenance \cite{edara2021bigmetadata}.
 
 In-file statistics such as Parquet column-chunk min/max values are necessary but insufficient: the total footer metadata is $O(\#\textit{files} \times \#\textit{columns})$, and every footer must be opened to perform file selection \cite{zeng2024columnar}.
-For wide tables with thousands of columns, this amounts to hundreds of megabytes of metadata parsing per planning cycle.
+For wide tables with thousands of columns, this forces planners to parse far more metadata than any single query requires.
 External index structures that decouple file selection from footer reads are essential \cite{liu2023openformats}.
 
 Apache Hudi addresses this by treating metadata as first-class data.
-Cloud data warehouses have long recognized the value of managed metadata: Snowflake maintains per-micro-partition zone maps in a dedicated metadata service \cite{dageville2016snowflake}, BigQuery stores fine-grained column and block statistics as distributed system tables \cite{edara2021bigmetadata}, and Redshift keeps in-memory zone maps with automatic sort-key optimization \cite{armenatzoglou2022redshift}, but these are proprietary and engine-specific.
+Cloud data warehouses have long maintained metadata as a managed, indexed structure---Snowflake with zone maps in a dedicated service \cite{dageville2016snowflake}, BigQuery with distributed statistics tables \cite{edara2021bigmetadata}, Redshift with in-memory zone maps \cite{armenatzoglou2022redshift}---but these rely on proprietary, always-on metadata services tightly coupled to a single engine.
+An open lakehouse has no such service: metadata must reside alongside data on object storage, remain readable by any engine, and stay consistent without a centralized coordinator.
 Hudi brings this principle to the open lakehouse: each table maintains an internal \emph{metadata table}, co-located with data files, that stores file listings and multiple index modalities---replacing recursive listings and broad footer scans with index-based planning \cite{hudi-metadata,onehouse-mmi}.
 Hudi further supports \emph{concurrent indexing} to build large indexes online without pausing ingestion \cite{hudi-indexing}.
 
