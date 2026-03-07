@@ -7,7 +7,7 @@
 
 % Avoid the default "Conference'17" placeholders in acmart.
 \acmConference[FORMATS '26]{1st International Workshop on Data FORMATS for Modern Architectures and Workloads}{May 31, 2026}{Bengaluru, India}
-\acmBooktitle{1st International Workshop on Data FORMATS for Modern Architectures and Workloads (FORMATS '26), May 31, 2026, Bengaluru, India}
+\acmBooktitle{Companion of the 2026 International Conference on Management of Data (SIGMOD/PODS '26), May 31--June 5, 2026, Bengaluru, India}
 \acmYear{2026}
 \copyrightyear{2026}
 
@@ -62,10 +62,10 @@
 
 \begin{abstract}
 As lakehouse tables scale toward millions of files and partitions, metadata itself becomes big data.
-Traditional big data systems try to reduce metadata to keep management tractable, compromising query performance; cloud data warehouses like Snowflake, BigQuery, and Redshift instead treat metadata as a managed, indexed structure---but within proprietary architectures.
-Apache Hudi brings this principle to the open lakehouse, treating \emph{metadata as data}: an internal Merge-on-Read table whose partitions implement a multi-modal indexing subsystem---column statistics, bloom filters, record-level, secondary, and expression indexes---all transactionally coupled with data commits and stored in an SSTable-like layout (HFile) optimized for the point and prefix lookups that dominate query planning.
+Traditional big data systems try to reduce metadata to keep management tractable, at the cost of query performance; cloud data warehouses like Snowflake, BigQuery, and Redshift treat metadata as a managed, indexed structure, but within proprietary architectures.
+Apache Hudi brings this principle to the open lakehouse by treating \emph{metadata as data}: an internal Merge-on-Read table whose partitions implement a multi-modal indexing subsystem (column statistics, bloom filters, record-level, secondary, and expression indexes), transactionally coupled with data commits and stored in an SSTable-like layout (HFile) tuned for the point and prefix lookups that dominate query planning.
 Concurrent indexing via a three-phase protocol backfills large indexes online while writers continue to commit.
-We summarize the design and report improvements on both synthetic benchmarks (TPC-DS) and Uber production workloads, demonstrating over 99\% reduction in data scanned (secondary index on a 1.8\,TB table), record-level index lookups 64$\times$ faster than global simple index at 36\,billion-row scale with sub-millisecond per-key latency even at 400\,billion+ rows, and 72\% lower write latency on upsert workloads.
+We describe the design and report results on both synthetic benchmarks (TPC-DS) and Uber production workloads: over 99\% reduction in data scanned (secondary index on a 1.8\,TB table), record-level index lookups 64$\times$ faster than global simple index at 36\,billion-row scale with sub-millisecond per-key latency even at 400\,billion+ rows, and 72\% lower write latency on upsert workloads.
 \end{abstract}
 
 \begin{CCSXML}
@@ -95,15 +95,15 @@ We summarize the design and report improvements on both synthetic benchmarks (TP
 
 Open table formats have become the transactional layer for lakehouse deployments on cloud object storage \cite{zaharia2021lakehouse}.
 At large scale, metadata becomes the bottleneck: directory listings and bulk footer/stat reads dominate planning latency and API cost \cite{armbrust2020deltalake}.
-Production deployments underscore the magnitude: Uber manages 19,500+ datasets (350\,PB, 6\,trillion rows/day) on Apache Hudi \cite{uber-hudi-blog}, and ByteDance operates an exabyte-scale lake \cite{bytedance-hudi-blog}.
+The scale of production deployments is striking: Uber manages 19,500+ datasets (350\,PB, 6\,trillion rows/day) on Apache Hudi \cite{uber-hudi-blog}, and ByteDance operates an exabyte-scale lake \cite{bytedance-hudi-blog}.
 As systems reach this scale, metadata requires database-style techniques for storage, indexing, and maintenance \cite{edara2021bigmetadata}.
 
 In-file statistics such as Parquet column-chunk min/max values are necessary but insufficient: the total footer metadata is $O(\#\textit{files} \times \#\textit{columns})$, and every footer must be opened to perform file selection \cite{zeng2024columnar}.
 For wide tables with thousands of columns, this forces planners to parse far more metadata than any single query requires.
-External index structures that decouple file selection from footer reads are essential \cite{liu2023openformats}.
+External index structures that decouple file selection from footer reads become necessary \cite{liu2023openformats}.
 
 Apache Hudi addresses this by treating metadata as first-class data.
-Cloud data warehouses have long maintained metadata as a managed, indexed structure---Snowflake with zone maps in a dedicated service \cite{dageville2016snowflake}, BigQuery with distributed statistics tables \cite{edara2021bigmetadata}, Redshift with in-memory zone maps \cite{armenatzoglou2022redshift}---but these rely on proprietary, always-on metadata services tightly coupled to a single engine.
+Cloud data warehouses have long maintained metadata as a managed, indexed structure: Snowflake uses zone maps in a dedicated service \cite{dageville2016snowflake}, BigQuery stores distributed statistics tables \cite{edara2021bigmetadata}, and Redshift keeps in-memory zone maps \cite{armenatzoglou2022redshift}. However, all three rely on proprietary, always-on metadata services coupled to a single engine.
 An open lakehouse has no such service: metadata must reside alongside data on object storage, remain readable by any engine, and stay consistent without a centralized coordinator.
 Hudi brings this principle to the open lakehouse: each table maintains an internal \emph{metadata table}, co-located with data files, that stores file listings and multiple index modalities---replacing recursive listings and broad footer scans with index-based planning \cite{hudi-metadata,onehouse-mmi}.
 Hudi further supports \emph{concurrent indexing} to build large indexes online without pausing ingestion \cite{hudi-indexing}.
@@ -200,7 +200,7 @@ Planners issue prefix lookups only for columns referenced by a query, reducing w
 \section{Multi-Modal Indexing}
 \label{sec:modalities}
 
-Hudi's metadata table acts as an \emph{index substrate}: index modalities are materialized as partitions and can be enabled/disabled independently as workload needs evolve \cite{hudi-metadata,hudi-indexes}.
+Hudi's metadata table acts as an \emph{index substrate}: index modalities are materialized as partitions and can be enabled or disabled independently as workload needs evolve \cite{hudi-metadata,hudi-indexes}.
 Table~\ref{tab:modalities} summarizes key modalities and their database analogues.
 
 \begin{table*}[t]
@@ -225,27 +225,27 @@ Table~\ref{tab:modalities} summarizes key modalities and their database analogue
 
 \paragraph{Record-level index.}
 The record-level index (RLI) maps record keys to data-table locations in the \texttt{record\_index} partition \cite{hudi-indexes,hudi-techspec}.
-This is the lakehouse analogue of a \emph{primary index}: it enables efficient upserts and deletes by avoiding full file-group scans to locate candidate records.
+It serves the same role as a primary index in a database: upserts and deletes no longer require full file-group scans to locate candidate records.
 To accommodate large key spaces, the record index uses hash-based sharding and supports point lookups for keyed reads \cite{hudi-indexes,hudi-rli-blog}.
 
 \paragraph{Column statistics and data skipping.}
 The \texttt{column\_stats} partition stores per-file, per-column aggregates (min, max, null count, value count) in the metadata table.
 Query planners evaluate predicates against these statistics to skip files whose value ranges provably exclude matching records---the same principle as zone maps in cloud data warehouses \cite{dageville2016snowflake,edara2021bigmetadata,armenatzoglou2022redshift}.
-This coarse-grained pruning composes with bloom filters and secondary indexes to progressively narrow the candidate file set.
+Coarse-grained statistics pruning composes with bloom filters and secondary indexes to further narrow the candidate file set.
 
 \paragraph{Expression index.}
 An expression index indexes a function of a column, stored as an \texttt{expr\_index} partition \cite{hudi-indexes,hudi-techspec}.
-This is the lakehouse analogue of indexes on expressions in PostgreSQL \cite{pg-expr-index}: it creates an access path for predicates that do not match raw columns.
+The concept mirrors expression indexes in PostgreSQL \cite{pg-expr-index}, creating an access path for predicates that do not match raw columns.
 
 \paragraph{Partition evolution.}
 A table partitioned by day cannot prune at finer granularity without repartitioning; an expression index on an hour-extraction function provides hour-level pruning without changing the physical layout.
 
 \paragraph{Adaptive bloom filters.}
 Hudi supports \emph{adaptive bloom filters} for membership testing during upserts, adjusting filter size per file to maintain a configured false-positive ratio \cite{hudi-indexes}.
-This matters for streaming and skewed workloads where file-group cardinalities vary and static filters would saturate.
+This is useful for streaming and skewed workloads where file-group cardinalities vary and static filters would saturate.
 
 \paragraph{Secondary index.}
-The secondary index accelerates predicates on non-key columns via a two-hop lookup---secondary value $\rightarrow$ record key $\rightarrow$ file location---reusing RLI rather than maintaining a separate file-location mapping \cite{hudi-techspec}.
+The secondary index accelerates predicates on non-key columns through a two-hop lookup (secondary value $\rightarrow$ record key $\rightarrow$ file location), reusing RLI rather than maintaining a separate file-location mapping \cite{hudi-techspec}.
 
 \section{Concurrent Indexing}
 \label{sec:concurrent}
@@ -360,10 +360,10 @@ All three major open table formats address the metadata bottleneck with differen
 Delta Lake consolidates file-level statistics in a transaction log with periodic Parquet checkpoints \cite{armbrust2020deltalake}.
 Iceberg organizes snapshots as a manifest hierarchy with per-file column statistics in manifests and Puffin sidecar files for bloom filters and sketches \cite{iceberg-spec}.
 
-Hudi extends the metadata-management idea into a generalized index substrate.
-Rather than a log or manifest tree, Hudi stores metadata in an internal MoR table where each index modality (record-level, secondary, expression) is an independently managed partition \cite{hudi-metadata,hudi-indexes}.
-The HFile-based layout optimizes for point and prefix lookup patterns, and the concurrent indexing protocol (\S\ref{sec:concurrent}) provides an explicit mechanism for building indexes online \cite{hudi-indexing}.
-This positions the metadata table as an extensible, lookup-oriented index structure that borrows from database indexing principles.
+Hudi takes the metadata-management idea further.
+Rather than a log or manifest tree, Hudi stores metadata in an internal MoR table where each index modality is an independently managed partition \cite{hudi-metadata,hudi-indexes}.
+The HFile-based layout is tuned for point and prefix lookup patterns, and the concurrent indexing protocol (\S\ref{sec:concurrent}) allows building indexes online \cite{hudi-indexing}.
+The result is an extensible, lookup-oriented index structure that applies database indexing techniques to open table formats.
 In enterprise data lakes where records flow through multiple transformation stages with upserts at each stage, such a substrate directly reduces the cost of locating and updating records across the pipeline.
 
 \section{Conclusion}
@@ -372,7 +372,7 @@ At exabyte scale, metadata management is a data-management problem.
 Hudi's metadata-as-data design stores metadata and indexes as a first-class internal MoR table, couples updates via multi-table transactions, and organizes index modalities as independently maintained partitions.
 The metadata table storage format optimizes for the point and prefix lookup patterns that dominate lakehouse query planning, and concurrent indexing enables online backfill without pausing writers.
 Future directions include bitmap and vector indexes for broader predicate types, cost-based index selection, and cross-format index interoperability.
-As tables grow, metadata must be treated as managed, indexed data, and we believe the metadata-as-data pattern offers a principled foundation for this evolution.
+As tables grow, metadata must be treated as managed, indexed data; we argue that the metadata-as-data pattern provides a practical foundation for doing so.
 
 \bibliographystyle{ACM-Reference-Format}
 \bibliography{references}
