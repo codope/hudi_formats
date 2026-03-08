@@ -184,8 +184,16 @@ The metadata table is a Merge-on-Read (MoR) Hudi table where each metadata or in
 MoR is the natural fit because every data commit generates metadata updates; rather than rewriting base files on each commit, MoR appends delta logs and compacts in the background, ensuring that ingestion latency is not penalized by metadata maintenance \cite{hudi-metadata}.
 
 \paragraph{Transactional consistency.}
-Hudi translates each data table write into metadata table updates and couples the two timelines so they remain in sync (Figure~\ref{fig:mdt-partitions-keys}) \cite{hudi-metadata}.
-A write is visible only when \emph{both} the data table and metadata table are committed, preventing partial exposure of data or index state under failures \cite{onehouse-mmi}.
+Every Hudi table maintains a \emph{timeline}: a log of all actions
+(writes, compactions, clustering) at monotonically increasing instants
+\cite{hudi-metadata}.
+The metadata table has its own timeline in a parent-child relationship
+with the data table's timeline: each data commit triggers a corresponding
+metadata commit at the same instant, keeping the two always in sync
+(Figure~\ref{fig:mdt-partitions-keys}).
+A write is visible only when \emph{both} the data and metadata commits
+complete, preventing partial exposure of data or index state under
+failures \cite{onehouse-mmi}.
 
 \paragraph{HFile for point and prefix lookups.}
 Lakehouse metadata access is dominated by \emph{point} and \emph{prefix} lookups (e.g., ``stats for column \texttt{c} in file \texttt{f}'', ``all blooms for partition \texttt{p}'').
@@ -212,7 +220,7 @@ Table~\ref{tab:modalities} summarizes key modalities and their database analogue
 \toprule
 \textbf{MDT partition / modality} & \textbf{DB analogue} & \textbf{Primary effect} \\
 \midrule
-\texttt{record\_index} (global RLI) & primary index & fast upserts/deletes; point lookups \\
+\texttt{record\_index} & primary index & fast upserts/deletes; point lookups \\
 \texttt{secondary\_index} & secondary (inverted) index & accelerate predicates on non-key columns \\
 \texttt{expr\_index} & functional index & accelerate predicates on expressions; aids partition evolution \\
 \texttt{column\_stats} & zone maps / min-max stats & file pruning via data skipping; wide-table selective reads \\
@@ -250,8 +258,7 @@ The secondary index accelerates predicates on non-key columns through a two-hop 
 \section{Concurrent Indexing}
 \label{sec:concurrent}
 
-Indexes increase write cost because they must be maintained as data changes.
-In a continuously ingested lakehouse table, pausing writers to build a new index would violate ingestion SLAs.
+Indexes increase write cost because they must be maintained as data changes; in a continuously ingested lakehouse table, pausing writers to build a new index would violate ingestion SLAs.
 Traditional databases perform online index builds under row-level locks, but lakehouse writers operate over immutable file groups on object storage, where coordination must happen at the commit-metadata level.
 Hudi addresses this with asynchronous \emph{concurrent indexing} that builds indexes while writers continue to commit (Figure~\ref{fig:concurrent}) \cite{hudi-indexing}.
 
@@ -281,32 +288,45 @@ Hudi addresses this with asynchronous \emph{concurrent indexing} that builds ind
     % Reconcile phase
     \node[phase, fill=gray!40, minimum width=12mm, anchor=west]
       (reconcile) at (50,0) {Reconcile};
-    \node[annot, below=0.5mm of reconcile] {validate $c_2$,$c_3$; lock};
+    \node[annot, below=0.5mm of reconcile] {catch up inflight; lock};
 
     % --- Vertical dashed line at indexing instant ---
     \draw[densely dashed, thin, gray!60] (14,17) -- (14,-9);
     \node[annot, anchor=north] at (14,-8) {indexing instant};
   \end{tikzpicture}
-  \caption{Concurrent indexing protocol. The indexer snapshots completed commits under a brief lock (Schedule), materializes index files while writers continue unblocked (Execute), then reconciles missed commits under a metadata-table lock (Reconcile).}
+  \caption{Concurrent indexing protocol. The indexer snapshots completed commits and publishes an index plan under a brief lock (Schedule), then materializes index entries while writers continue unblocked---new commits observe the plan and write their own index updates (Execute). Finally, only commits that were inflight at the indexing instant are caught up (Reconcile).}
   \label{fig:concurrent}
-  \Description[Concurrent indexing timeline]{Swimlane timeline with two lanes: Writer lane showing four commits (c1 through c4) on a horizontal arrow, and Indexer lane below showing three phases: Schedule (dark gray, takes brief lock at commit c1), Execute (light gray, no lock, runs while c2 and c3 are committed), and Reconcile (dark gray, validates c2 and c3 under lock). A vertical dashed line marks the indexing instant.}
+  \Description[Concurrent indexing timeline]{Swimlane timeline with two lanes: Writer lane showing four commits (c1 through c4) on a horizontal arrow, and Indexer lane below showing three phases: Schedule (dark gray, takes brief lock at commit c1 and publishes index plan), Execute (light gray, no lock, runs while writers observe the plan and include their own index updates), and Reconcile (dark gray, catches up inflight commits under lock). A vertical dashed line marks the indexing instant.}
 \end{figure}
 
-Concurrent indexing uses a three-phase protocol that combines optimistic and multi-version concurrency control techniques:
-(1) \textbf{Schedule} snapshots all completed commits up to an \emph{indexing instant} under a brief metadata-table lock, establishing a consistent baseline;
-(2) \textbf{Execute} materializes index entries from the snapshotted files without holding any lock---this is the expensive phase (scanning base files, computing index keys), and writers continue committing unblocked; and
-(3) \textbf{Reconcile} reacquires the metadata-table lock, identifies commits that landed during execution ($c_2$, $c_3$), and applies catch-up index updates for those commits before finalizing.
+Concurrent indexing uses a three-phase protocol:
+(1) \textbf{Schedule} acquires a brief metadata-table lock, snapshots all
+completed commits up to an \emph{indexing instant}, and publishes an index
+plan that subsequent writers will observe;
+(2) \textbf{Execute} materializes index entries from the snapshotted files
+without holding any lock---writers that commit after the indexing instant
+observe the published plan and include their own index updates in each
+commit, so they need no catch-up; and
+(3) \textbf{Reconcile} reacquires the metadata-table lock and catches up
+any writes that were inflight at the indexing instant---these are the only
+commits whose index entries were not captured by either the snapshot or the
+normal commit path.
 
 \paragraph{Consistency invariant.}
-Because metadata updates are transactionally coupled to data commits (\S\ref{sec:mdt}), reconciliation can deterministically replay missed commits: each data commit records exactly which files were added or removed, and the indexer applies the corresponding index mutations.
-If a conflict is detected---e.g., a commit was rolled back between schedule and reconcile---the indexing attempt aborts and retries from a fresh snapshot, ensuring no partial index state is ever visible to readers.
-After the initial build, subsequent data commits maintain the index incrementally through the same transactional coupling, so the concurrent protocol is needed only for first-time index creation or full rebuilds.
+Because each data commit records exactly which files were added or removed
+(\S\ref{sec:mdt}), the indexer can derive index entries for the small number
+of inflight commits deterministically.
+If a conflict is detected (e.g., a commit rolled back between schedule and
+reconcile), the indexing attempt aborts and retries from a fresh snapshot.
+After the initial build, subsequent data commits maintain the index
+incrementally through the same transactional coupling, so the concurrent
+protocol is needed only for first-time index creation or full rebuilds.
 
 \section{Evaluation}
 \label{sec:eval}
 
 \paragraph{Setup.}
-The secondary index benchmark uses Hudi with Spark on a 1.8\,TB TPC-DS \texttt{store\_sales} table (286K files, 7.2\,billion rows).
+The secondary index benchmark uses Hudi with Spark with 480 executors on a 1.8\,TB TPC-DS \texttt{store\_sales} table (286K files, 7.2\,billion rows) stored on S3.
 The RLI lookup benchmark uses Spark with 1,000 executors on Uber production tables stored on GCS.
 
 \paragraph{Secondary index.}
@@ -348,30 +368,29 @@ On a separate 1\,TB upsert workload, RLI also reduces write latency by 72\% and 
 \end{tabular}
 \end{table}
 
-\paragraph{Production evidence.}
+\paragraph{Production deployment.}
 Of Uber's 19,500+ Hudi datasets (\S\ref{sec:intro}), 3,600 upsert-heavy tables rely on the record index in production, with per-key lookup latency of 1--2\,ms from sharded HFiles \cite{uber-hudi-blog}.
-
-\paragraph{Limitations.}
-Cross-format benchmarks against Delta Lake and Apache Iceberg indexing remain important future work.
+Each record-index entry is fixed-size (50--70 bytes compressed).
+For one of the largest tables (549\,TB data, 10K shards), the record index
+adds 40\,TB (${\sim}7\%$ of data size;), and for small tables it is under 1\%.
+The fixed per-record cost favors wide schemas: tables with many columns
+amortize index overhead over larger rows.
 
 \section{Discussion}
 
-All three major open table formats address the metadata bottleneck with different architectural choices.
+All three major open table formats address the metadata bottleneck differently; cross-format evaluations at enterprise scale exist \cite{walmart-blog}, but indexing-specific benchmarks remain future work.
 Delta Lake consolidates file-level statistics in a transaction log with periodic Parquet checkpoints \cite{armbrust2020deltalake}.
 Iceberg organizes snapshots as a manifest hierarchy with per-file column statistics in manifests and Puffin sidecar files for bloom filters and sketches \cite{iceberg-spec}.
 
-Hudi takes the metadata-management idea further.
-Rather than a log or manifest tree, Hudi stores metadata in an internal MoR table where each index modality is an independently managed partition \cite{hudi-metadata,hudi-indexes}.
+Hudi takes the metadata-management idea further: rather than a log or manifest tree, it stores metadata in an internal MoR table where each index modality is an independently managed partition \cite{hudi-metadata,hudi-indexes}.
 The HFile-based layout is tuned for point and prefix lookup patterns, and the concurrent indexing protocol (\S\ref{sec:concurrent}) allows building indexes online \cite{hudi-indexing}.
-The result is an extensible, lookup-oriented index structure that applies database indexing techniques to open table formats.
 In enterprise data lakes where records flow through multiple transformation stages with upserts at each stage, such a substrate directly reduces the cost of locating and updating records across the pipeline.
 
 \section{Conclusion}
 
 At exabyte scale, metadata management is a data-management problem.
-Hudi's metadata-as-data design stores metadata and indexes as a first-class internal MoR table, couples updates via multi-table transactions, and organizes index modalities as independently maintained partitions.
-The metadata table storage format optimizes for the point and prefix lookup patterns that dominate lakehouse query planning, and concurrent indexing enables online backfill without pausing writers.
-Future directions include bitmap and vector indexes for broader predicate types, cost-based index selection, and cross-format index interoperability.
+Hudi's metadata-as-data design stores metadata and indexes as a first-class internal MoR table, couples updates via multi-table transactions, organizes index modalities as independently maintained partitions, and uses an optimized layout for the point and prefix lookups that dominate query planning; concurrent indexing enables online backfill without pausing writers.
+Future directions include bitmap and vector indexes, cost-based index selection, and cross-format index interoperability.
 As tables grow, metadata must be treated as managed, indexed data; we argue that the metadata-as-data pattern provides a practical foundation for doing so.
 
 \bibliographystyle{ACM-Reference-Format}
