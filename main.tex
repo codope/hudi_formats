@@ -174,7 +174,7 @@ We evaluate on TPC-DS and Uber production tables at up to 400\,billion+ rows.
     \draw[darr] ([xshift=-10mm]mdt.north east) -- ([xshift=-10mm]dt.south east)
       node[lbl, right] {pruned file set};
   \end{tikzpicture}
-  \caption{Metadata-as-data architecture and index substrate. Writers atomically commit data and metadata; query planners selectively consult metadata-table partitions for pruned file sets. Left column accelerates planning/pruning; right column accelerates writes and point lookups. Each partition uses sorted HFiles with composite prefix keys.}
+  \caption{Metadata-as-data architecture and index substrate. Writers atomically commit data and metadata; query planners selectively consult metadata-table partitions for pruned file sets.}
   \label{fig:mdt-partitions-keys}
   \Description[Metadata-as-data architecture with index partitions]{Three-tier diagram showing Writer and Query Planner actors at top, a Data Table in the middle with Parquet base files and delta logs, and a Metadata Table at bottom with six partitions in two columns: planning/pruning (files, column\_stats, partition\_stats) on the left and writes/lookups (bloom\_filters, record\_index, secondary/expr index) on the right. Solid arrows show commit and plan paths; dashed arrows show atomic coupling, selective lookup, and pruned file-set return paths.}
 \end{figure}
@@ -182,6 +182,7 @@ We evaluate on TPC-DS and Uber production tables at up to 400\,billion+ rows.
 \paragraph{Organization.}
 The metadata table is a Merge-on-Read (MoR) Hudi table where each metadata or index type is a distinct partition (see Table~\ref{tab:modalities}) \cite{hudi-metadata,hudi-indexes}.
 MoR is the natural fit because every data commit generates metadata updates; rather than rewriting base files on each commit, MoR appends delta logs and compacts in the background, ensuring that ingestion latency is not penalized by metadata maintenance \cite{hudi-metadata}.
+Because transactional coupling, MoR compaction, and the HFile layout are shared infrastructure, adding a new index modality requires only defining a new partition---no changes to the write protocol or storage layer.
 
 \paragraph{Transactional consistency.}
 Every Hudi table maintains a \emph{timeline}: a log of all actions
@@ -243,10 +244,7 @@ Coarse-grained statistics pruning composes with bloom filters and secondary inde
 
 \paragraph{Expression index.}
 An expression index indexes a function of a column, stored as an \texttt{expr\_index} partition \cite{hudi-indexes,hudi-techspec}.
-The concept mirrors expression indexes in PostgreSQL \cite{pg-expr-index}, creating an access path for predicates that do not match raw columns.
-
-\paragraph{Partition evolution.}
-A table partitioned by day cannot prune at finer granularity without repartitioning; an expression index on an hour-extraction function provides hour-level pruning without changing the physical layout.
+The concept mirrors expression indexes in PostgreSQL \cite{pg-expr-index}, creating an access path for predicates that do not match raw columns---e.g., an hour-extraction index provides hour-level pruning on a day-partitioned table without changing the physical layout.
 
 \paragraph{Adaptive bloom filters.}
 Hudi supports \emph{adaptive bloom filters} for membership testing during upserts, adjusting filter size per file to maintain a configured false-positive ratio \cite{hudi-indexes}.
@@ -294,7 +292,7 @@ Hudi addresses this with asynchronous \emph{concurrent indexing} that builds ind
     \draw[densely dashed, thin, gray!60] (14,17) -- (14,-9);
     \node[annot, anchor=north] at (14,-8) {indexing instant};
   \end{tikzpicture}
-  \caption{Concurrent indexing protocol. The indexer snapshots completed commits and publishes an index plan under a brief lock (Schedule), then materializes index entries while writers continue unblocked---new commits observe the plan and write their own index updates (Execute). Finally, only commits that were inflight at the indexing instant are caught up (Reconcile).}
+  \caption{Concurrent indexing protocol. Schedule takes a brief lock and publishes an index plan; Execute materializes entries while writers proceed unblocked; Reconcile catches up inflight commits.}
   \label{fig:concurrent}
   \Description[Concurrent indexing timeline]{Swimlane timeline with two lanes: Writer lane showing four commits (c1 through c4) on a horizontal arrow, and Indexer lane below showing three phases: Schedule (dark gray, takes brief lock at commit c1 and publishes index plan), Execute (light gray, no lock, runs while writers observe the plan and include their own index updates), and Reconcile (dark gray, catches up inflight commits under lock). A vertical dashed line marks the indexing instant.}
 \end{figure}
@@ -326,7 +324,7 @@ protocol is needed only for first-time index creation or full rebuilds.
 \label{sec:eval}
 
 \paragraph{Setup.}
-The secondary index benchmark uses Hudi with Spark with 480 executors on a 1.8\,TB TPC-DS \texttt{store\_sales} table (286K files, 7.2\,billion rows) stored on S3.
+The secondary index benchmark uses Hudi with Spark with 480 executors on a 1.8\,TB TPC-DS \texttt{store\_sales} table (286K files, 7.2\,billion rows) stored on S3; the query predicate is an equality filter on \texttt{ss\_customer\_sk} with randomly chosen keys.
 The RLI lookup benchmark uses Spark with 1,000 executors on Uber production tables stored on GCS.
 
 \paragraph{Secondary index.}
@@ -372,7 +370,7 @@ On a separate 1\,TB upsert workload, RLI also reduces write latency by 72\% and 
 Of Uber's 19,500+ Hudi datasets (\S\ref{sec:intro}), 3,600 upsert-heavy tables rely on the record index in production, with per-key lookup latency of 1--2\,ms from sharded HFiles \cite{uber-hudi-blog}.
 Each record-index entry is fixed-size (50--70 bytes compressed).
 For one of the largest tables (549\,TB data, 10K shards), the record index
-adds 40\,TB (${\sim}7\%$ of data size;), and for small tables it is under 1\%.
+adds 40\,TB (${\sim}7\%$ of data size), and for small tables it is under 1\%.
 The fixed per-record cost favors wide schemas: tables with many columns
 amortize index overhead over larger rows.
 
@@ -385,6 +383,7 @@ Iceberg organizes snapshots as a manifest hierarchy with per-file column statist
 Hudi takes the metadata-management idea further: rather than a log or manifest tree, it stores metadata in an internal MoR table where each index modality is an independently managed partition \cite{hudi-metadata,hudi-indexes}.
 The HFile-based layout is tuned for point and prefix lookup patterns, and the concurrent indexing protocol (\S\ref{sec:concurrent}) allows building indexes online \cite{hudi-indexing}.
 In enterprise data lakes where records flow through multiple transformation stages with upserts at each stage, such a substrate directly reduces the cost of locating and updating records across the pipeline.
+Multiple query engines (Spark, Flink, Presto, Trino) already access the metadata table through Hudi's connector layer, so the index benefits extend across the lakehouse engine ecosystem.
 
 \section{Conclusion}
 
