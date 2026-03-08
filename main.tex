@@ -184,7 +184,7 @@ The metadata table is a Merge-on-Read (MoR) Hudi table where each metadata or in
 MoR is the natural fit because every data commit generates metadata updates; rather than rewriting base files on each commit, MoR appends delta logs and compacts in the background, ensuring that ingestion latency is not penalized by metadata maintenance \cite{hudi-metadata}.
 
 \paragraph{Transactional consistency.}
-Hudi translates each data table write into metadata table updates and couples the two timelines so they remain in sync (Figure~\ref{fig:mdt-partitions-keys}) \cite{hudi-metadata}.
+Hudi translates each data table write into metadata table updates and couples the two timelines so they remain in sync (Figure~\ref{fig:mdt-partitions-keys}) \cite{hudi-metadata}. // does the figure really illustrate how we keep two timelines in sync?
 A write is visible only when \emph{both} the data table and metadata table are committed, preventing partial exposure of data or index state under failures \cite{onehouse-mmi}.
 
 \paragraph{HFile for point and prefix lookups.}
@@ -212,7 +212,7 @@ Table~\ref{tab:modalities} summarizes key modalities and their database analogue
 \toprule
 \textbf{MDT partition / modality} & \textbf{DB analogue} & \textbf{Primary effect} \\
 \midrule
-\texttt{record\_index} (global RLI) & primary index & fast upserts/deletes; point lookups \\
+\texttt{record\_index} & primary index & fast upserts/deletes; point lookups \\
 \texttt{secondary\_index} & secondary (inverted) index & accelerate predicates on non-key columns \\
 \texttt{expr\_index} & functional index & accelerate predicates on expressions; aids partition evolution \\
 \texttt{column\_stats} & zone maps / min-max stats & file pruning via data skipping; wide-table selective reads \\
@@ -294,12 +294,12 @@ Hudi addresses this with asynchronous \emph{concurrent indexing} that builds ind
 
 Concurrent indexing uses a three-phase protocol that combines optimistic and multi-version concurrency control techniques:
 (1) \textbf{Schedule} snapshots all completed commits up to an \emph{indexing instant} under a brief metadata-table lock, establishing a consistent baseline;
-(2) \textbf{Execute} materializes index entries from the snapshotted files without holding any lock---this is the expensive phase (scanning base files, computing index keys), and writers continue committing unblocked; and
+(2) \textbf{Execute} materialized index entries from the snapshotted files without holding any lock---this is the expensive phase (scanning base files, computing index keys), and writers continue committing unblocked; and
 (3) \textbf{Reconcile} reacquires the metadata-table lock, identifies commits that landed during execution ($c_2$, $c_3$), and applies catch-up index updates for those commits before finalizing.
 
 \paragraph{Consistency invariant.}
 Because metadata updates are transactionally coupled to data commits (\S\ref{sec:mdt}), reconciliation can deterministically replay missed commits: each data commit records exactly which files were added or removed, and the indexer applies the corresponding index mutations.
-If a conflict is detected---e.g., a commit was rolled back between schedule and reconcile---the indexing attempt aborts and retries from a fresh snapshot, ensuring no partial index state is ever visible to readers.
+If a conflict is detected---e.g., a commit is rolled back between schedule and reconcile---the indexing attempt aborts and retries from a fresh snapshot, ensuring no partial index state is ever visible to readers.
 After the initial build, subsequent data commits maintain the index incrementally through the same transactional coupling, so the concurrent protocol is needed only for first-time index creation or full rebuilds.
 
 \section{Evaluation}
