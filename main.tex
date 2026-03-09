@@ -65,7 +65,7 @@ As lakehouse tables scale toward millions of files and partitions, metadata itse
 Traditional big data systems try to reduce metadata to keep management tractable, at the cost of query performance; cloud data warehouses like Snowflake, BigQuery, and Redshift treat metadata as a managed, indexed structure, but within proprietary architectures.
 Apache Hudi brings this principle to the open lakehouse by treating \emph{metadata as data}: an internal Merge-on-Read table whose partitions implement a multi-modal indexing subsystem (column statistics, bloom filters, record-level, secondary, and expression indexes), transactionally coupled with data commits and stored in an SSTable-like layout (HFile) tuned for the point and prefix lookups that dominate query planning.
 Concurrent indexing via a three-phase protocol backfills large indexes online while writers continue to commit.
-We describe the design and report results on both synthetic benchmarks (TPC-DS) and Uber production workloads: over 99\% reduction in data scanned (secondary index on a 1.8\,TB table), record-level index lookups 64$\times$ faster than global simple index at 36\,billion-row scale with sub-millisecond per-key latency even at 400\,billion+ rows, and 72\% lower write latency on upsert workloads.
+We describe the design and report results on both synthetic benchmarks and Uber production workloads: over 99\% reduction in data scanned (secondary index on a table from TPC-DS SF10000 dataset), record-level index lookups 64$\times$ faster than global simple index at 36\,billion-row scale with sub-millisecond per-key latency even at 400\,billion+ rows, and 72\% lower write latency on upsert workloads.
 \end{abstract}
 
 \begin{CCSXML}
@@ -324,14 +324,14 @@ protocol is needed only for first-time index creation or full rebuilds.
 \label{sec:eval}
 
 \paragraph{Setup.}
-The secondary index benchmark uses Hudi with Spark with 480 executors on a 1.8\,TB TPC-DS \texttt{store\_sales} table (286K files, 7.2\,billion rows) stored on S3; the query predicate is an equality filter on \texttt{ss\_customer\_sk} with randomly chosen keys.
+The secondary index benchmark uses Hudi with Spark with 480 executors on the TPC-DS (SF10000) \texttt{web\_sales} table (286K files, 7.2\,billion rows) stored on S3; the query predicate is an equality filter on \texttt{ws\_ship\_customer\_sk} with randomly chosen keys.
 The RLI lookup benchmark uses Spark with 1,000 executors on Uber production tables stored on GCS.
 
 \paragraph{Secondary index.}
-A secondary index on the \texttt{store\_sales} table reduces data scanned by over 99\% (759\,GB to 593\,MB) and files read from 286,603 to 150, improving warm-run query latency by 96\% (Table~\ref{tab:tpcds}).
+A secondary index on the \texttt{web\_sales} table reduces data scanned by over 99\% (759\,GB to 593\,MB) and files read from 286,603 to 150, improving warm-run query latency by 96\% (Table~\ref{tab:tpcds}).
 
 \begin{table}[t]
-\caption{Secondary index benchmark on a 1.8\,TB TPC-DS \texttt{store\_sales} table (286K files, 7.2\,billion rows).}
+\caption{Secondary index benchmark on TPC-DS (SF10000) \texttt{web\_sales} (286K files, 7.2\,billion rows).}
 \label{tab:tpcds}
 \centering
 \small
