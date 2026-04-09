@@ -1,6 +1,6 @@
 \documentclass[sigconf]{acmart}
 
-% FORMATS'26: 3 pages excluding references, ACM 2-column proceedings style.
+% FORMATS'26 camera-ready: 4 pages excluding references, ACM 2-column proceedings style.
 \settopmatter{printfolios=true,printacmref=true}
 \setcopyright{none}
 \renewcommand\footnotetextcopyrightpermission[1]{}
@@ -210,6 +210,8 @@ Planners issue prefix lookups only for columns referenced by a query, reducing w
 \label{sec:modalities}
 
 Hudi's metadata table acts as an \emph{index substrate}: index modalities are materialized as partitions and can be enabled or disabled independently as workload needs evolve \cite{hudi-metadata,hudi-indexes}.
+The indexing granularity varies by modality: column statistics and bloom filters operate per-file, while the record-level and secondary indexes operate per-record.
+Per-file granularity aligns with the immutable file-group model on object storage; finer-grained indexing (e.g., per-row-group within Parquet files) is an extensible design point, as new granularities can be introduced as additional metadata-table partitions without changes to the write protocol.
 Table~\ref{tab:modalities} summarizes key modalities and their database analogues.
 
 \begin{table*}[t]
@@ -375,21 +377,73 @@ The fixed per-record cost favors wide schemas: tables with many columns
 amortize index overhead over larger rows.
 
 \section{Discussion}
+\label{sec:discussion}
 
+\paragraph{Design trade-offs through the RUM lens.}
+The RUM conjecture observes that any access method can optimize at most two of three costs: Read, Update, and Memory (space) overhead \cite{athanassoulis2016rum}.
+Hudi's metadata table makes a deliberate trade-off along these axes.
+\emph{Reads} are optimized through the HFile layout with block indexes for point and prefix lookups, and through multi-modal pruning that composes column statistics, bloom filters, and secondary indexes.
+\emph{Updates} are optimized by the MoR design: each data commit appends metadata deltas to log files rather than rewriting base files, and background compaction amortizes merge cost asynchronously.
+The trade-off is \emph{Memory}: the metadata table consumes additional storage.
+As reported in \S\ref{sec:eval}, the record index adds ${\sim}7\%$ of data size for the largest Uber table (40\,TB index on 549\,TB data) and under 1\% for small tables; column statistics and bloom filters add comparatively less.
+The fixed per-record cost of the record index (50--70 bytes compressed) favors wide schemas, where the index overhead is amortized over larger rows.
+
+\paragraph{Write performance impact.}
+Transactional coupling means every data commit must also update the metadata table, introducing additional write-path work.
+The MoR design mitigates this: metadata updates are appended as delta logs, not rewritten, so the per-commit cost is proportional to the number of files touched rather than total metadata size.
+For upsert-heavy workloads, the net effect is positive: RLI eliminates the costly join against every file group that global simple index requires, reducing write latency by 72\% and data shuffled by 92\% on a 1\,TB workload (\S\ref{sec:eval}).
+The overhead is more visible for append-only workloads that do not benefit from record-level lookups; operators can selectively enable only the modalities that match their access patterns.
+Metadata-table compaction runs as a background table service, consuming I/O that must be budgeted alongside data compaction; at Uber, compaction frequency is tuned per-table based on delta-log accumulation rates \cite{uber-hudi-blog}.
+
+\paragraph{Cross-format comparison.}
 All three major open table formats address the metadata bottleneck differently; cross-format evaluations at enterprise scale exist \cite{walmart-blog}, but indexing-specific benchmarks remain future work.
-Delta Lake consolidates file-level statistics in a transaction log with periodic Parquet checkpoints \cite{armbrust2020deltalake}.
-Iceberg organizes snapshots as a manifest hierarchy with per-file column statistics in manifests and Puffin sidecar files for bloom filters and sketches \cite{iceberg-spec}.
+Table~\ref{tab:comparison} compares key design dimensions.
+Delta Lake consolidates file-level statistics in a transaction log with periodic Parquet checkpoints \cite{armbrust2020deltalake}; statistics are embedded in the checkpoint format, so adding a new index modality requires extending the checkpoint schema.
+Iceberg organizes snapshots as a manifest hierarchy with per-file column statistics in manifest entries, and uses Puffin sidecar files for bloom filters and sketches \cite{iceberg-spec}; new index types require defining new Puffin blob types and reader-side support.
+Hudi stores metadata in an internal MoR table where each index modality is an independently managed partition \cite{hudi-metadata,hudi-indexes}: adding a new modality requires only a new partition, with no changes to the write protocol or storage layer.
 
-Hudi takes the metadata-management idea further: rather than a log or manifest tree, it stores metadata in an internal MoR table where each index modality is an independently managed partition \cite{hudi-metadata,hudi-indexes}.
-The HFile-based layout is tuned for point and prefix lookup patterns, and the concurrent indexing protocol (\S\ref{sec:concurrent}) allows building indexes online \cite{hudi-indexing}.
-In enterprise data lakes where records flow through multiple transformation stages with upserts at each stage, such a substrate directly reduces the cost of locating and updating records across the pipeline.
-Multiple query engines (Spark, Flink, Presto, Trino) already access the metadata table through Hudi's connector layer, so the index benefits extend across the lakehouse engine ecosystem.
+The formats align on per-file column statistics for data skipping---an established technique mirroring zone maps in cloud data warehouses.
+They diverge on richer index structures: only Hudi supports record-level and secondary indexes as first-class metadata, enabling sub-millisecond keyed lookups and two-hop predicate acceleration that go beyond file pruning.
+Iceberg's Puffin format provides a clean extension point for statistical structures, and a comparative study of Puffin-based versus partition-based extensibility at scale would be valuable future work.
+
+\begin{table}[t]
+\caption{Metadata design comparison across open table formats.}
+\label{tab:comparison}
+\centering
+\scriptsize
+\begin{tabular}{@{}p{1.6cm}p{2.0cm}p{1.9cm}p{1.8cm}@{}}
+\toprule
+\textbf{Dimension} & \textbf{Hudi} & \textbf{Delta Lake} & \textbf{Iceberg} \\
+\midrule
+Structure & Internal MoR table (partitioned) & Transaction log + Parquet checkpoints & Manifest hierarchy + Puffin sidecars \\
+\addlinespace
+Stats storage & \texttt{column\_stats} partition (HFile) & Checkpoint Parquet columns & Manifest entries \\
+\addlinespace
+Record index & \texttt{record\_index} (hash-sharded HFile) & N/A & N/A \\
+\addlinespace
+Bloom filters & \texttt{bloom\_filters} partition & N/A & Puffin blob \\
+\addlinespace
+Adding new index & New MDT partition & Checkpoint schema change & New Puffin blob type \\
+\addlinespace
+Lookup pattern & Point + prefix via HFile block index & Checkpoint scan or log replay & Manifest scan + Puffin reads \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Co-located vs.\ externalized metadata.}
+DuckLake \cite{ducklake2025} takes the metadata-as-data idea in a different direction by storing all metadata in a relational database (e.g., DuckDB or PostgreSQL) rather than in files on object storage.
+This represents a fundamental architectural trade-off: co-located file-based metadata (as in Hudi) requires no external service, inherits the same durability and replication as data files, and works in any object-store deployment, but requires purpose-built storage formats (HFile) and its own compaction.
+Externalized database metadata leverages SQL query capabilities and proven indexing, but introduces an additional service dependency, a separate failure domain, and a consistency boundary between the metadata store and data files.
+The choice depends on deployment context: serverless and multi-cloud environments favor co-located metadata that requires no additional infrastructure, while managed platforms with always-on services may prefer externalized metadata for its query flexibility.
+
+Multiple query engines (Spark, Flink, Presto, Trino) already access Hudi's metadata table through the connector layer, so the index benefits extend across the lakehouse engine ecosystem.
+However, engine support remains uneven---a gap that motivates standardized interfaces for index discovery and consumption across formats and engines.
 
 \section{Conclusion}
 
 At exabyte scale, metadata management is a data-management problem.
 Hudi's metadata-as-data design stores metadata and indexes as a first-class internal MoR table, couples updates via multi-table transactions, organizes index modalities as independently maintained partitions, and uses an optimized layout for the point and prefix lookups that dominate query planning; concurrent indexing enables online backfill without pausing writers.
-Future directions include bitmap and vector indexes, cost-based index selection, and cross-format index interoperability.
+Future directions include bitmap and vector indexes---where index entries may not co-locate with data file groups, requiring the metadata table to serve as a standalone lookup structure rather than a per-file-group auxiliary---as well as cost-based index selection and cross-format standardization of index discovery and consumption interfaces.
 As tables grow, metadata must be treated as managed, indexed data; we argue that the metadata-as-data pattern provides a practical foundation for doing so.
 
 \bibliographystyle{ACM-Reference-Format}
